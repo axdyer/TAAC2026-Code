@@ -5,7 +5,6 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 """
 
 import os
-import glob
 import shutil
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -107,19 +106,39 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.eval_checkpoint_index: int = 0
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
-    def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
+    @staticmethod
+    def _format_metric(value: float) -> str:
+        """Format a metric value for safe checkpoint directory names."""
+        return f"{value:.6f}".replace("-", "neg")
+
+    def _build_step_dir_name(
+        self,
+        global_step: int,
+        is_best: bool = False,
+        eval_index: Optional[int] = None,
+        val_auc: Optional[float] = None,
+        val_logloss: Optional[float] = None,
+    ) -> str:
         """Build a checkpoint sub-directory name such as
-        ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
+        ``eval0001.global_step2500.layer=2.head=4.hidden=64.auc=0.860000``.
         """
-        parts = [f"global_step{global_step}"]
+        parts = []
+        if eval_index is not None:
+            parts.append(f"eval{eval_index:04d}")
+        parts.append(f"global_step{global_step}")
         for key in ("layer", "head", "hidden"):
             if key in self.ckpt_params:
                 parts.append(f"{key}={self.ckpt_params[key]}")
+        if val_auc is not None:
+            parts.append(f"auc={self._format_metric(val_auc)}")
+        if val_logloss is not None:
+            parts.append(f"logloss={self._format_metric(val_logloss)}")
         name = ".".join(parts)
         if is_best:
             name += ".best_model"
@@ -167,11 +186,22 @@ class PCVRHyFormerRankingTrainer:
             with open(os.path.join(ckpt_dir, 'train_config.json'), 'w') as f:
                 json.dump(cfg_to_dump, f, indent=2)
 
+    @staticmethod
+    def _write_metrics_file(ckpt_dir: str, metrics: Dict[str, Any]) -> None:
+        """Write eval metrics next to checkpoint weights."""
+        import json
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(os.path.join(ckpt_dir, 'metrics.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+
     def _save_step_checkpoint(
         self,
         global_step: int,
         is_best: bool = False,
         skip_model_file: bool = False,
+        eval_index: Optional[int] = None,
+        val_auc: Optional[float] = None,
+        val_logloss: Optional[float] = None,
     ) -> str:
         """Save ``model.pt`` plus sidecar files under a ``global_step`` sub-dir.
 
@@ -185,23 +215,31 @@ class PCVRHyFormerRankingTrainer:
         Returns:
             The absolute path of the checkpoint directory.
         """
-        dir_name = self._build_step_dir_name(global_step, is_best=is_best)
+        dir_name = self._build_step_dir_name(
+            global_step,
+            is_best=is_best,
+            eval_index=eval_index,
+            val_auc=val_auc,
+            val_logloss=val_logloss,
+        )
         ckpt_dir = os.path.join(self.save_dir, dir_name)
+        if os.path.exists(ckpt_dir) and not is_best:
+            raise FileExistsError(
+                f"Refusing to overwrite existing eval checkpoint directory: {ckpt_dir}"
+            )
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
             torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
+        self._write_metrics_file(ckpt_dir, {
+            "eval_index": eval_index,
+            "global_step": global_step,
+            "val_AUC": val_auc,
+            "val_logloss": val_logloss,
+            "is_best": is_best,
+        })
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
-
-    def _remove_old_best_dirs(self) -> None:
-        """Delete stale ``*.best_model`` directories so that only the latest
-        best checkpoint is kept on disk.
-        """
-        pattern = os.path.join(self.save_dir, "global_step*.best_model")
-        for old_dir in glob.glob(pattern):
-            shutil.rmtree(old_dir)
-            logging.info(f"Removed old best_model dir: {old_dir}")
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
@@ -221,70 +259,42 @@ class PCVRHyFormerRankingTrainer:
         val_auc: float,
         val_logloss: float,
     ) -> None:
-        """Persist a new-best checkpoint atomically.
+        """Save every eval checkpoint and keep a separate best checkpoint."""
+        self.eval_checkpoint_index += 1
+        self._save_step_checkpoint(
+            total_step,
+            eval_index=self.eval_checkpoint_index,
+            val_auc=val_auc,
+            val_logloss=val_logloss,
+        )
 
-        Flow (ordered to avoid leaving empty sidecar-only directories on disk):
-
-        1. Decide whether ``val_auc`` is *likely* to beat the current best
-           using the same threshold as ``EarlyStopping._is_not_improved``,
-           so our pre-cleanup and EarlyStopping's internal save decision
-           stay in sync.
-        2. If unlikely, short-circuit: do nothing on disk. We must NOT
-           touch ``self.early_stopping.checkpoint_path`` or call
-           ``_write_sidecar_files`` because the target directory may not
-           exist yet (sidecar-only dirs would otherwise be created here,
-           producing checkpoints with missing ``model.pt``).
-        3. If likely, point ``EarlyStopping`` at the canonical
-           ``global_stepN.best_model/model.pt`` path, remove any stale
-           ``*.best_model`` dirs, then run ``EarlyStopping`` (which writes
-           ``model.pt`` when it actually confirms a new best).
-        4. Only after ``EarlyStopping`` has confirmed a new best
-           (``best_score != old_best``) do we write the sidecar files into
-           the freshly-created directory; this is guarded so that a
-           razor-close score that tripped ``is_likely_new_best`` but not
-           ``EarlyStopping``'s own gate does not create a stray dir.
-        """
         old_best = self.early_stopping.best_score
-        is_likely_new_best = (
-            old_best is None
-            or val_auc > old_best + self.early_stopping.delta
-        )
-        if not is_likely_new_best:
-            # No new best anticipated: leave disk untouched. The previous
-            # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
-                "best_val_AUC": val_auc,
-                "best_val_logloss": val_logloss,
-            })
-            return
-
-        # Point EarlyStopping at the canonical best-model location for this
-        # step. Only done on the likely-new-best branch so that a skipped
-        # save never leaks the unused path into EarlyStopping state.
-        best_dir = os.path.join(
-            self.save_dir,
-            self._build_step_dir_name(total_step, is_best=True),
-        )
+        best_dir = os.path.join(self.save_dir, "best_model")
         self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
-
-        # Remove stale best dirs first so EarlyStopping's write is the only
-        # I/O needed when a new best is confirmed.
-        self._remove_old_best_dirs()
 
         self.early_stopping(val_auc, self.model, {
             "best_val_AUC": val_auc,
             "best_val_logloss": val_logloss,
+            "best_global_step": total_step,
+            "best_eval_index": self.eval_checkpoint_index,
         })
 
-        # Write sidecar files only when EarlyStopping actually confirmed a
-        # new best and wrote model.pt. If the score tripped our heuristic
-        # but EarlyStopping internally declined to save, skip to avoid
-        # creating an empty (sidecar-only) checkpoint directory.
         if self.early_stopping.best_score != old_best and os.path.exists(
             self.early_stopping.checkpoint_path
         ):
-            self._save_step_checkpoint(
-                total_step, is_best=True, skip_model_file=True)
+            self._write_sidecar_files(best_dir)
+            self._write_metrics_file(best_dir, {
+                "eval_index": self.eval_checkpoint_index,
+                "global_step": total_step,
+                "best_val_AUC": val_auc,
+                "best_val_logloss": val_logloss,
+                "is_best": True,
+            })
+            logging.info(
+                f"Updated best checkpoint at {best_dir}/model.pt "
+                f"(eval={self.eval_checkpoint_index}, step={total_step}, "
+                f"AUC={val_auc}, LogLoss={val_logloss})"
+            )
 
     def train(self) -> None:
         """Main training loop: iterates over epochs, performs step-level and
