@@ -8,6 +8,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
+    --split_mode timestamp \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

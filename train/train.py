@@ -74,10 +74,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
+    parser.add_argument('--split_mode', type=str, default='timestamp',
+                        choices=['timestamp', 'rowgroup'],
+                        help='Train/valid split mode. timestamp = row-level time '
+                             'split by timestamp, using the latest valid_ratio rows '
+                             'as validation; rowgroup = baseline tail Row Group split.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use in rowgroup split '
+                             '(timestamp split requires this to stay at 1.0)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
-                        help='Fraction of all Row Groups used for validation (takes the tail)')
+                        help='Fraction of data used for validation. timestamp split uses '
+                             'the latest rows by timestamp; rowgroup split uses tail Row Groups.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -245,6 +252,7 @@ def main() -> None:
         batch_size=args.batch_size,
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
+        split_mode=args.split_mode,
         num_workers=args.num_workers,
         buffer_batches=args.buffer_batches,
         seed=args.seed,

@@ -19,6 +19,7 @@ import gc
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
@@ -151,6 +152,9 @@ class PCVRParquetDataset(IterableDataset):
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
+        timestamp_min: Optional[int] = None,
+        timestamp_max: Optional[int] = None,
+        known_num_rows: Optional[int] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
     ) -> None:
@@ -167,11 +171,23 @@ class PCVRParquetDataset(IterableDataset):
             buffer_batches: shuffle buffer size in units of batches.
             row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
                 use all Row Groups.
+            timestamp_min: optional inclusive lower bound for row-level
+                ``timestamp`` filtering.
+            timestamp_max: optional exclusive upper bound for row-level
+                ``timestamp`` filtering.
+            known_num_rows: exact row count after filtering. Used for logging
+                and progress estimates when timestamp filtering is enabled.
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
         """
         super().__init__()
+
+        if timestamp_min is not None and timestamp_max is not None:
+            if timestamp_min >= timestamp_max:
+                raise ValueError(
+                    f"timestamp_min must be < timestamp_max, got "
+                    f"{timestamp_min} >= {timestamp_max}")
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -188,6 +204,12 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.timestamp_min = timestamp_min
+        self.timestamp_max = timestamp_max
+        self._timestamp_filter_enabled = (
+            timestamp_min is not None or timestamp_max is not None
+        )
+        self._known_num_rows = known_num_rows is not None
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -203,7 +225,11 @@ class PCVRParquetDataset(IterableDataset):
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
 
-        self.num_rows = sum(r[2] for r in self._rg_list)
+        self.num_rows = (
+            int(known_num_rows)
+            if known_num_rows is not None
+            else sum(r[2] for r in self._rg_list)
+        )
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
@@ -212,6 +238,10 @@ class PCVRParquetDataset(IterableDataset):
         pf = pq.ParquetFile(self._parquet_files[0])
         schema_names = pf.schema_arrow.names
         self._col_idx = {name: i for i, name in enumerate(schema_names)}
+        if self._timestamp_filter_enabled and 'timestamp' not in self._col_idx:
+            raise KeyError(
+                "timestamp split/filter was requested, but the parquet schema "
+                "does not contain a 'timestamp' column")
 
         # ---- Pre-allocate numpy buffers ----
         B = batch_size
@@ -267,7 +297,8 @@ class PCVRParquetDataset(IterableDataset):
         logging.info(
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
-            f"buffer_batches={buffer_batches}, shuffle={shuffle}")
+            f"buffer_batches={buffer_batches}, shuffle={shuffle}, "
+            f"timestamp_min={timestamp_min}, timestamp_max={timestamp_max}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -330,6 +361,8 @@ class PCVRParquetDataset(IterableDataset):
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
     def __len__(self) -> int:
+        if self._known_num_rows:
+            return (self.num_rows + self.batch_size - 1) // self.batch_size
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
@@ -345,6 +378,9 @@ class PCVRParquetDataset(IterableDataset):
         for file_path, rg_idx, _ in rg_list:
             pf = pq.ParquetFile(file_path)
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
+                batch = self._filter_batch_by_timestamp(batch)
+                if batch is None:
+                    continue
                 batch_dict = self._convert_batch(batch)
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
@@ -384,6 +420,43 @@ class PCVRParquetDataset(IterableDataset):
         buffer.clear()
 
     # ---- Helpers ----
+
+    def _filter_batch_by_timestamp(
+        self,
+        batch: "pa.RecordBatch",
+    ) -> Optional["pa.RecordBatch"]:
+        """Apply the row-level timestamp filter for time-based train/valid split."""
+        if not self._timestamp_filter_enabled:
+            return batch
+
+        ts_col = batch.column(self._col_idx['timestamp'])
+        if ts_col.null_count:
+            raise ValueError(
+                "timestamp contains null values; timestamp split requires "
+                "non-null timestamps")
+
+        mask = None
+        if self.timestamp_min is not None:
+            cond = pc.greater_equal(
+                ts_col,
+                pa.scalar(self.timestamp_min, type=ts_col.type),
+            )
+            mask = cond if mask is None else pc.and_(mask, cond)
+        if self.timestamp_max is not None:
+            cond = pc.less(
+                ts_col,
+                pa.scalar(self.timestamp_max, type=ts_col.type),
+            )
+            mask = cond if mask is None else pc.and_(mask, cond)
+
+        if mask is None:
+            return batch
+
+        mask = pc.fill_null(mask, False)
+        filtered = batch.filter(mask)
+        if filtered.num_rows == 0:
+            return None
+        return filtered
 
     def _record_oob(
         self,
@@ -675,6 +748,7 @@ def get_pcvr_data(
     batch_size: int = 256,
     valid_ratio: float = 0.1,
     train_ratio: float = 1.0,
+    split_mode: str = 'timestamp',
     num_workers: int = 16,
     buffer_batches: int = 20,
     shuffle_train: bool = True,
@@ -685,8 +759,12 @@ def get_pcvr_data(
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    Split modes:
+      - ``timestamp``: compute a row-level cutoff from the ``timestamp`` column.
+        Rows with ``timestamp < cutoff`` are train; rows with
+        ``timestamp >= cutoff`` are validation.
+      - ``rowgroup``: reproduce the baseline behavior, using the tail
+        ``valid_ratio`` fraction of Row Groups as validation.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -695,9 +773,20 @@ def get_pcvr_data(
         the model.
     """
     random.seed(seed)
+    if not (0.0 < valid_ratio < 1.0):
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    if split_mode not in ('timestamp', 'rowgroup'):
+        raise ValueError(
+            f"split_mode must be either 'timestamp' or 'rowgroup', got {split_mode!r}")
+    if split_mode == 'timestamp' and train_ratio < 1.0:
+        raise ValueError(
+            "--train_ratio < 1.0 is only supported with --split_mode rowgroup. "
+            "Timestamp mode uses all rows before the timestamp cutoff.")
 
     import glob as _glob
     pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
+    if not pq_files:
+        raise FileNotFoundError(f"No .parquet files in {data_dir}")
 
     rg_info = []
     for f in pq_files:
@@ -706,19 +795,37 @@ def get_pcvr_data(
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
 
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    timestamp_cutoff: Optional[int] = None
+    train_row_group_range: Optional[Tuple[int, int]] = None
+    valid_row_group_range: Optional[Tuple[int, int]] = None
+    train_timestamp_max: Optional[int] = None
+    valid_timestamp_min: Optional[int] = None
 
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+    if split_mode == 'timestamp':
+        timestamp_cutoff, train_rows, valid_rows = _compute_timestamp_split(
+            rg_info=rg_info,
+            valid_ratio=valid_ratio,
+        )
+        train_timestamp_max = timestamp_cutoff
+        valid_timestamp_min = timestamp_cutoff
+    else:
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        # train_ratio: use only the first N% of the training Row Groups.
+        if train_ratio < 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(
+                f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_row_group_range = (0, n_train_rgs)
+        valid_row_group_range = (n_train_rgs, total_rgs)
+
+        logging.info(
+            f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+            f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,7 +834,9 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=train_row_group_range,
+        timestamp_max=train_timestamp_max,
+        known_num_rows=train_rows if split_mode == 'timestamp' else None,
         clip_vocab=clip_vocab,
     )
 
@@ -749,7 +858,9 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_range=valid_row_group_range,
+        timestamp_min=valid_timestamp_min,
+        known_num_rows=valid_rows if split_mode == 'timestamp' else None,
         clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(
@@ -757,7 +868,79 @@ def get_pcvr_data(
         num_workers=0, pin_memory=use_cuda,
     )
 
-    logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
+    logging.info(f"Parquet split_mode={split_mode}, train: {train_rows} rows, "
+                 f"valid: {valid_rows} rows, timestamp_cutoff={timestamp_cutoff}, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
+
+
+def _compute_timestamp_split(
+    rg_info: List[Tuple[str, int, int]],
+    valid_ratio: float,
+    scan_batch_size: int = 65536,
+) -> Tuple[int, int, int]:
+    """Compute the timestamp cutoff for a strict row-level time split."""
+    total_rows = sum(n for _, _, n in rg_info)
+    if total_rows <= 1:
+        raise ValueError(f"Need at least 2 rows for timestamp split, got {total_rows}")
+
+    chunks: List[np.ndarray] = []
+    for file_path, rg_idx, _ in rg_info:
+        pf = pq.ParquetFile(file_path)
+        if 'timestamp' not in pf.schema_arrow.names:
+            raise KeyError(f"{file_path} does not contain required column 'timestamp'")
+        for batch in pf.iter_batches(
+            batch_size=scan_batch_size,
+            row_groups=[rg_idx],
+            columns=['timestamp'],
+        ):
+            col = batch.column(0)
+            if col.null_count:
+                raise ValueError(
+                    f"timestamp contains null values in {file_path}, "
+                    f"row_group={rg_idx}")
+            chunks.append(col.to_numpy(zero_copy_only=False).astype(np.int64))
+
+    if not chunks:
+        raise ValueError("No timestamp values found while computing timestamp split")
+
+    timestamps = np.concatenate(chunks)
+    if timestamps.shape[0] != total_rows:
+        raise ValueError(
+            f"Timestamp scan row count mismatch: scanned {timestamps.shape[0]} "
+            f"but parquet metadata reports {total_rows}")
+
+    n_valid_target = max(1, int(total_rows * valid_ratio))
+    cutoff_index = total_rows - n_valid_target
+    if cutoff_index <= 0 or cutoff_index >= total_rows:
+        raise ValueError(
+            f"Invalid timestamp cutoff index {cutoff_index} for total_rows={total_rows}, "
+            f"valid_ratio={valid_ratio}")
+
+    cutoff = int(np.partition(timestamps, cutoff_index)[cutoff_index])
+    train_rows = int((timestamps < cutoff).sum())
+    valid_rows = int((timestamps >= cutoff).sum())
+    if train_rows <= 0 or valid_rows <= 0:
+        raise ValueError(
+            "Timestamp split produced an empty partition: "
+            f"cutoff={cutoff}, train_rows={train_rows}, valid_rows={valid_rows}. "
+            "This usually means the timestamp distribution has too many identical values.")
+
+    equal_cutoff_rows = int((timestamps == cutoff).sum())
+    logging.info(
+        "Timestamp split: train uses timestamp < %s, valid uses timestamp >= %s; "
+        "train_rows=%s, valid_rows=%s, target_valid_ratio=%.6f, "
+        "actual_valid_ratio=%.6f, min_timestamp=%s, max_timestamp=%s, "
+        "rows_equal_cutoff=%s",
+        cutoff,
+        cutoff,
+        train_rows,
+        valid_rows,
+        valid_ratio,
+        valid_rows / total_rows,
+        int(timestamps.min()),
+        int(timestamps.max()),
+        equal_cutoff_rows,
+    )
+    return cutoff, train_rows, valid_rows
