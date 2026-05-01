@@ -254,12 +254,11 @@ class PCVRHyFormerRankingTrainer:
         val_logloss: Optional[float] = None,
     ) -> str:
         """Build a checkpoint sub-directory name such as
-        ``eval0001.global_step2500.layer=2.head=4.hidden=64.auc=0.860000``.
+        ``global_step2500.eval0001.layer=2.head=4.hidden=64.auc=0.860000``.
         """
-        parts = []
+        parts = [f"global_step{global_step}"]
         if eval_index is not None:
             parts.append(f"eval{eval_index:04d}")
-        parts.append(f"global_step{global_step}")
         for key in ("layer", "head", "hidden"):
             if key in self.ckpt_params:
                 parts.append(f"{key}={self.ckpt_params[key]}")
