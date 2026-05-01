@@ -434,14 +434,16 @@ class PCVRHyFormerRankingTrainer:
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
-            train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
+            train_pbar = tqdm(enumerate(self.train_loader),
                               dynamic_ncols=True,
                               disable=not self.show_progress_bar)
             loss_sum = 0.0
+            steps_in_epoch = 0
 
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
+                steps_in_epoch += 1
                 loss_sum += loss
 
                 if self.writer:
@@ -471,7 +473,13 @@ class PCVRHyFormerRankingTrainer:
                         logging.info(f"Early stopping at step {total_step}")
                         return
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            if steps_in_epoch == 0:
+                raise RuntimeError(
+                    f"train_loader yielded no batches in epoch {epoch}; "
+                    "check data_dir, split settings, and timestamp filters"
+                )
+            logging.info(
+                f"Epoch {epoch}, Average Loss: {loss_sum / steps_in_epoch}")
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
@@ -585,7 +593,7 @@ class PCVRHyFormerRankingTrainer:
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader),
+        pbar = tqdm(enumerate(self.valid_loader),
                     disable=not self.show_progress_bar)
 
         all_logits_list = []
