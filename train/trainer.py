@@ -158,6 +158,90 @@ class PCVRHyFormerRankingTrainer:
         """Format a metric value for safe checkpoint directory names."""
         return f"{value:.6f}".replace("-", "neg")
 
+    @staticmethod
+    def _format_diag_value(value: float) -> str:
+        """Format a diagnostic scalar for compact single-line logs."""
+        if np.isnan(value):
+            return "nan"
+        if np.isposinf(value):
+            return "inf"
+        if np.isneginf(value):
+            return "-inf"
+        return f"{value:.6f}"
+
+    @staticmethod
+    def _safe_mean(arr: np.ndarray) -> float:
+        if arr.size == 0:
+            return float('nan')
+        return float(np.mean(arr))
+
+    @staticmethod
+    def _safe_std(arr: np.ndarray) -> float:
+        if arr.size == 0:
+            return float('nan')
+        return float(np.std(arr))
+
+    @staticmethod
+    def _safe_quantiles(arr: np.ndarray) -> Tuple[float, float, float]:
+        if arr.size == 0:
+            return float('nan'), float('nan'), float('nan')
+        q01, q50, q99 = np.quantile(arr, [0.01, 0.5, 0.99])
+        return float(q01), float(q50), float(q99)
+
+    def _log_eval_diagnostics(
+        self,
+        epoch: int,
+        labels_np: np.ndarray,
+        logits_np: np.ndarray,
+        probs_np: np.ndarray,
+    ) -> None:
+        """Log lightweight validation diagnostics from cached predictions."""
+        n = int(probs_np.size)
+        if n == 0:
+            logging.info(f"VALID_DIAGNOSTICS epoch={epoch} n=0")
+            return
+
+        labels_float = labels_np.astype(np.float32, copy=False)
+        pos_mask = labels_np == 1
+        neg_mask = labels_np == 0
+
+        pred_p01, pred_p50, pred_p99 = self._safe_quantiles(probs_np)
+        logit_p01, logit_p50, logit_p99 = self._safe_quantiles(logits_np)
+        pred_pos_mean = self._safe_mean(probs_np[pos_mask])
+        pred_neg_mean = self._safe_mean(probs_np[neg_mask])
+        logit_pos_mean = self._safe_mean(logits_np[pos_mask])
+        logit_neg_mean = self._safe_mean(logits_np[neg_mask])
+        pred_margin = pred_pos_mean - pred_neg_mean
+        logit_margin = logit_pos_mean - logit_neg_mean
+        brier_score = float(np.mean((probs_np - labels_float) ** 2))
+
+        fmt = self._format_diag_value
+        logging.info(
+            "VALID_DIAGNOSTICS"
+            f" epoch={epoch}"
+            f" n={n}"
+            f" pos={int(pos_mask.sum())}"
+            f" neg={int(neg_mask.sum())}"
+            f" label_rate={fmt(self._safe_mean(labels_float))}"
+            f" pred_mean={fmt(self._safe_mean(probs_np))}"
+            f" pred_std={fmt(self._safe_std(probs_np))}"
+            f" pred_p01={fmt(pred_p01)}"
+            f" pred_p50={fmt(pred_p50)}"
+            f" pred_p99={fmt(pred_p99)}"
+            f" logit_mean={fmt(self._safe_mean(logits_np))}"
+            f" logit_std={fmt(self._safe_std(logits_np))}"
+            f" logit_p01={fmt(logit_p01)}"
+            f" logit_p50={fmt(logit_p50)}"
+            f" logit_p99={fmt(logit_p99)}"
+            f" pred_pos_mean={fmt(pred_pos_mean)}"
+            f" pred_neg_mean={fmt(pred_neg_mean)}"
+            f" pred_margin={fmt(pred_margin)}"
+            f" logit_pos_mean={fmt(logit_pos_mean)}"
+            f" logit_neg_mean={fmt(logit_neg_mean)}"
+            f" logit_margin={fmt(logit_margin)}"
+            f" brier={fmt(brier_score)}"
+        )
+
     def _build_step_dir_name(
         self,
         global_step: int,
@@ -512,6 +596,7 @@ class PCVRHyFormerRankingTrainer:
 
         # Binary AUC via sklearn.
         probs = torch.sigmoid(all_logits).numpy()
+        logits_np = all_logits.numpy()
         labels_np = all_labels.numpy()
 
         # Filter NaN predictions (may appear if gradients explode).
@@ -522,11 +607,14 @@ class PCVRHyFormerRankingTrainer:
             valid_mask = ~nan_mask
             probs = probs[valid_mask]
             labels_np = labels_np[valid_mask]
+            logits_np = logits_np[valid_mask]
 
         if len(probs) == 0 or len(np.unique(labels_np)) < 2:
             auc = 0.0
         else:
             auc = float(roc_auc_score(labels_np, probs))
+
+        self._log_eval_diagnostics(epoch, labels_np, logits_np, probs)
 
         # Binary logloss (same NaN filtering).
         valid_logits = all_logits[~torch.isnan(all_logits)]
