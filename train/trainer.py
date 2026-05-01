@@ -7,6 +7,7 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 import os
 import shutil
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -57,7 +58,12 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        amp_dtype: str = 'none',
+        compile_model: bool = False,
+        compile_mode: str = 'reduce-overhead',
+        show_progress_bar: bool = False,
     ) -> None:
+        self.raw_model: nn.Module = model
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
@@ -73,9 +79,9 @@ class PCVRHyFormerRankingTrainer:
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
-        if hasattr(model, 'get_sparse_params'):
-            sparse_params = model.get_sparse_params()
-            dense_params = model.get_dense_params()
+        if hasattr(self.raw_model, 'get_sparse_params'):
+            sparse_params = self.raw_model.get_sparse_params()
+            dense_params = self.raw_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -89,8 +95,19 @@ class PCVRHyFormerRankingTrainer:
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                self.raw_model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
+
+        self.amp_dtype_name: str = amp_dtype
+        self.amp_torch_dtype: Optional[torch.dtype] = self._resolve_amp_dtype(
+            amp_dtype, device)
+        self.use_amp: bool = self.amp_torch_dtype is not None
+
+        if compile_model:
+            if not hasattr(torch, 'compile'):
+                raise RuntimeError("compile_model=True requires torch.compile, but this torch build does not provide it")
+            logging.info(f"Compiling model with torch.compile(mode={compile_mode})")
+            self.model = torch.compile(self.raw_model, mode=compile_mode)
 
         self.num_epochs: int = num_epochs
         self.device: str = device
@@ -107,15 +124,126 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.eval_checkpoint_index: int = 0
+        self.show_progress_bar: bool = show_progress_bar
+        self._last_eval_diagnostics_log: Optional[str] = None
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"amp_dtype={amp_dtype}, compile_model={compile_model}, "
+                     f"show_progress_bar={show_progress_bar}")
+
+    @staticmethod
+    def _resolve_amp_dtype(amp_dtype: str, device: str) -> Optional[torch.dtype]:
+        """Resolve explicit AMP mode.
+
+        There is intentionally no silent fallback: when bf16 is requested on
+        unsupported hardware, the run stops before training starts.
+        """
+        if amp_dtype == 'none':
+            return None
+        if amp_dtype != 'bf16':
+            raise ValueError(f"Unsupported amp_dtype={amp_dtype!r}; expected 'none' or 'bf16'")
+        if not device.startswith('cuda'):
+            raise RuntimeError("amp_dtype=bf16 requires a CUDA device")
+        if not torch.cuda.is_available():
+            raise RuntimeError("amp_dtype=bf16 requested but CUDA is not available")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("amp_dtype=bf16 requested but this GPU/torch build does not support bf16")
+        return torch.bfloat16
+
+    def _autocast_context(self):
+        if self.amp_torch_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=self.amp_torch_dtype)
 
     @staticmethod
     def _format_metric(value: float) -> str:
         """Format a metric value for safe checkpoint directory names."""
         return f"{value:.6f}".replace("-", "neg")
+
+    @staticmethod
+    def _format_diag_value(value: float) -> str:
+        """Format a diagnostic scalar for compact single-line logs."""
+        if np.isnan(value):
+            return "nan"
+        if np.isposinf(value):
+            return "inf"
+        if np.isneginf(value):
+            return "-inf"
+        return f"{value:.6f}"
+
+    @staticmethod
+    def _safe_mean(arr: np.ndarray) -> float:
+        if arr.size == 0:
+            return float('nan')
+        return float(np.mean(arr))
+
+    @staticmethod
+    def _safe_std(arr: np.ndarray) -> float:
+        if arr.size == 0:
+            return float('nan')
+        return float(np.std(arr))
+
+    @staticmethod
+    def _safe_quantiles(arr: np.ndarray) -> Tuple[float, float, float]:
+        if arr.size == 0:
+            return float('nan'), float('nan'), float('nan')
+        q01, q50, q99 = np.quantile(arr, [0.01, 0.5, 0.99])
+        return float(q01), float(q50), float(q99)
+
+    def _build_eval_diagnostics_log(
+        self,
+        epoch: int,
+        labels_np: np.ndarray,
+        logits_np: np.ndarray,
+        probs_np: np.ndarray,
+    ) -> str:
+        """Build a compact validation diagnostics log line."""
+        n = int(probs_np.size)
+        if n == 0:
+            return f"VALID_DIAGNOSTICS epoch={epoch} n=0"
+
+        labels_float = labels_np.astype(np.float32, copy=False)
+        pos_mask = labels_np == 1
+        neg_mask = labels_np == 0
+
+        pred_p01, pred_p50, pred_p99 = self._safe_quantiles(probs_np)
+        logit_p01, logit_p50, logit_p99 = self._safe_quantiles(logits_np)
+        pred_pos_mean = self._safe_mean(probs_np[pos_mask])
+        pred_neg_mean = self._safe_mean(probs_np[neg_mask])
+        logit_pos_mean = self._safe_mean(logits_np[pos_mask])
+        logit_neg_mean = self._safe_mean(logits_np[neg_mask])
+        pred_margin = pred_pos_mean - pred_neg_mean
+        logit_margin = logit_pos_mean - logit_neg_mean
+        brier_score = float(np.mean((probs_np - labels_float) ** 2))
+
+        fmt = self._format_diag_value
+        return (
+            "VALID_DIAGNOSTICS"
+            f" epoch={epoch}"
+            f" n={n}"
+            f" pos={int(pos_mask.sum())}"
+            f" neg={int(neg_mask.sum())}"
+            f" label_rate={fmt(self._safe_mean(labels_float))}"
+            f" pred_mean={fmt(self._safe_mean(probs_np))}"
+            f" pred_std={fmt(self._safe_std(probs_np))}"
+            f" pred_p01={fmt(pred_p01)}"
+            f" pred_p50={fmt(pred_p50)}"
+            f" pred_p99={fmt(pred_p99)}"
+            f" logit_mean={fmt(self._safe_mean(logits_np))}"
+            f" logit_std={fmt(self._safe_std(logits_np))}"
+            f" logit_p01={fmt(logit_p01)}"
+            f" logit_p50={fmt(logit_p50)}"
+            f" logit_p99={fmt(logit_p99)}"
+            f" pred_pos_mean={fmt(pred_pos_mean)}"
+            f" pred_neg_mean={fmt(pred_neg_mean)}"
+            f" pred_margin={fmt(pred_margin)}"
+            f" logit_pos_mean={fmt(logit_pos_mean)}"
+            f" logit_neg_mean={fmt(logit_neg_mean)}"
+            f" logit_margin={fmt(logit_margin)}"
+            f" brier={fmt(brier_score)}"
+        )
 
     def _build_step_dir_name(
         self,
@@ -229,7 +357,7 @@ class PCVRHyFormerRankingTrainer:
             )
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(self.raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         self._write_metrics_file(ckpt_dir, {
             "eval_index": eval_index,
@@ -272,7 +400,7 @@ class PCVRHyFormerRankingTrainer:
         best_dir = os.path.join(self.save_dir, "best_model")
         self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
 
-        self.early_stopping(val_auc, self.model, {
+        self.early_stopping(val_auc, self.raw_model, {
             "best_val_AUC": val_auc,
             "best_val_logloss": val_logloss,
             "best_global_step": total_step,
@@ -303,11 +431,13 @@ class PCVRHyFormerRankingTrainer:
         """
         print("Start training (PCVRHyFormer)")
         self.model.train()
+        self.raw_model.train()
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
-                              dynamic_ncols=True)
+                              dynamic_ncols=True,
+                              disable=not self.show_progress_bar)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
@@ -325,9 +455,12 @@ class PCVRHyFormerRankingTrainer:
                     logging.info(f"Evaluating at step {total_step}")
                     val_auc, val_logloss = self.evaluate(epoch=epoch)
                     self.model.train()
+                    self.raw_model.train()
                     torch.cuda.empty_cache()
 
                     logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                    if self._last_eval_diagnostics_log:
+                        logging.info(self._last_eval_diagnostics_log)
 
                     if self.writer:
                         self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -343,9 +476,12 @@ class PCVRHyFormerRankingTrainer:
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
+            self.raw_model.train()
             torch.cuda.empty_cache()
 
             logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+            if self._last_eval_diagnostics_log:
+                logging.info(self._last_eval_diagnostics_log)
 
             if self.writer:
                 self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -371,8 +507,8 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
-                reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
-                sparse_params = self.model.get_sparse_params()
+                reinit_ptrs = self.raw_model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                sparse_params = self.raw_model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
@@ -414,22 +550,23 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        self.dense_optimizer.zero_grad()
+        self.dense_optimizer.zero_grad(set_to_none=True)
         if self.sparse_optimizer is not None:
-            self.sparse_optimizer.zero_grad()
+            self.sparse_optimizer.zero_grad(set_to_none=True)
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with self._autocast_context():
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        torch.nn.utils.clip_grad_norm_(self.raw_model.parameters(), max_norm=1.0, foreach=False)
 
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
@@ -445,25 +582,30 @@ class PCVRHyFormerRankingTrainer:
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
+        self.raw_model.eval()
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader),
+                    disable=not self.show_progress_bar)
 
         all_logits_list = []
         all_labels_list = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for step, batch in pbar:
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
 
-        all_logits = torch.cat(all_logits_list, dim=0)
+        # Autocast may produce bf16 logits; CPU numpy and sklearn metrics
+        # require fp32/float64-compatible arrays.
+        all_logits = torch.cat(all_logits_list, dim=0).float()
         all_labels = torch.cat(all_labels_list, dim=0).long()
 
         # Binary AUC via sklearn.
         probs = torch.sigmoid(all_logits).numpy()
+        logits_np = all_logits.numpy()
         labels_np = all_labels.numpy()
 
         # Filter NaN predictions (may appear if gradients explode).
@@ -474,11 +616,15 @@ class PCVRHyFormerRankingTrainer:
             valid_mask = ~nan_mask
             probs = probs[valid_mask]
             labels_np = labels_np[valid_mask]
+            logits_np = logits_np[valid_mask]
 
         if len(probs) == 0 or len(np.unique(labels_np)) < 2:
             auc = 0.0
         else:
             auc = float(roc_auc_score(labels_np, probs))
+
+        self._last_eval_diagnostics_log = self._build_eval_diagnostics_log(
+            epoch, labels_np, logits_np, probs)
 
         # Binary logloss (same NaN filtering).
         valid_logits = all_logits[~torch.isnan(all_logits)]
@@ -498,7 +644,8 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        with self._autocast_context():
+            logits, _ = self.raw_model.predict(model_input)  # (B, 1), (B, D)
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label

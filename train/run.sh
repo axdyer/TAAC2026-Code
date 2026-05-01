@@ -1,9 +1,11 @@
 #!/bin/bash
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
-python3 -u "${SCRIPT_DIR}/train.py" \
+"${PYTHON_BIN}" -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
@@ -11,7 +13,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --split_mode timestamp \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
+    --amp_dtype bf16 \
+    --compile_model \
+    --compile_mode default \
     --num_workers 8 \
+    --prefetch_factor 4 \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
