@@ -68,14 +68,34 @@ def parse_args() -> argparse.Namespace:
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
 
+    # Speed controls.
+    parser.add_argument('--amp_dtype', type=str, default='none',
+                        choices=['none', 'bf16'],
+                        help='Automatic mixed precision mode. bf16 requires CUDA '
+                             'bf16 support and fails immediately when unsupported.')
+    parser.add_argument('--compile_model', action='store_true', default=False,
+                        help='Compile the training forward path with torch.compile. '
+                             'Compilation failures are not swallowed.')
+    parser.add_argument('--no_compile_model', dest='compile_model',
+                        action='store_false',
+                        help='Explicitly disable torch.compile, useful for overriding run.sh')
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode used when --compile_model is set')
+    parser.add_argument('--allow_tf32', action='store_true', default=False,
+                        help='Enable CUDA TF32 matmul/cuDNN kernels for additional speed. '
+                             'This is explicit because it changes fp32 numerics.')
+
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
                         help='Number of DataLoader workers')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='DataLoader prefetch_factor when num_workers > 0')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -207,6 +227,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.num_workers > 0 and args.prefetch_factor < 1:
+        raise ValueError("--prefetch_factor must be >= 1 when --num_workers > 0")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -217,6 +239,14 @@ def main() -> None:
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
+
+    if args.allow_tf32:
+        if not args.device.startswith('cuda') or not torch.cuda.is_available():
+            raise RuntimeError("--allow_tf32 requires a CUDA device")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        logging.info("CUDA TF32 enabled for matmul and cuDNN")
 
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(args.tf_events_dir)
@@ -246,6 +276,7 @@ def main() -> None:
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
@@ -350,6 +381,9 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        amp_dtype=args.amp_dtype,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
     )
 
     trainer.train()

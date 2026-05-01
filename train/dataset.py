@@ -676,6 +676,7 @@ def get_pcvr_data(
     valid_ratio: float = 0.1,
     train_ratio: float = 1.0,
     num_workers: int = 16,
+    prefetch_factor: int = 2,
     buffer_batches: int = 20,
     shuffle_train: bool = True,
     seed: int = 42,
@@ -735,7 +736,7 @@ def get_pcvr_data(
     _train_kw = {}
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
-        _train_kw['prefetch_factor'] = 2
+        _train_kw['prefetch_factor'] = prefetch_factor
 
     train_loader = DataLoader(
         train_dataset, batch_size=None,
@@ -758,6 +759,7 @@ def get_pcvr_data(
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
+                 f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
+                 f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
 
     return train_loader, valid_loader, train_dataset
