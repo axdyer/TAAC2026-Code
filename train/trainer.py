@@ -61,6 +61,7 @@ class PCVRHyFormerRankingTrainer:
         amp_dtype: str = 'none',
         compile_model: bool = False,
         compile_mode: str = 'reduce-overhead',
+        show_progress_bar: bool = False,
     ) -> None:
         self.raw_model: nn.Module = model
         self.model: nn.Module = model
@@ -123,11 +124,14 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.eval_checkpoint_index: int = 0
+        self.show_progress_bar: bool = show_progress_bar
+        self._last_eval_diagnostics_log: Optional[str] = None
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"amp_dtype={amp_dtype}, compile_model={compile_model}")
+                     f"amp_dtype={amp_dtype}, compile_model={compile_model}, "
+                     f"show_progress_bar={show_progress_bar}")
 
     @staticmethod
     def _resolve_amp_dtype(amp_dtype: str, device: str) -> Optional[torch.dtype]:
@@ -188,18 +192,17 @@ class PCVRHyFormerRankingTrainer:
         q01, q50, q99 = np.quantile(arr, [0.01, 0.5, 0.99])
         return float(q01), float(q50), float(q99)
 
-    def _log_eval_diagnostics(
+    def _build_eval_diagnostics_log(
         self,
         epoch: int,
         labels_np: np.ndarray,
         logits_np: np.ndarray,
         probs_np: np.ndarray,
-    ) -> None:
-        """Log lightweight validation diagnostics from cached predictions."""
+    ) -> str:
+        """Build a compact validation diagnostics log line."""
         n = int(probs_np.size)
         if n == 0:
-            logging.info(f"VALID_DIAGNOSTICS epoch={epoch} n=0")
-            return
+            return f"VALID_DIAGNOSTICS epoch={epoch} n=0"
 
         labels_float = labels_np.astype(np.float32, copy=False)
         pos_mask = labels_np == 1
@@ -216,7 +219,7 @@ class PCVRHyFormerRankingTrainer:
         brier_score = float(np.mean((probs_np - labels_float) ** 2))
 
         fmt = self._format_diag_value
-        logging.info(
+        return (
             "VALID_DIAGNOSTICS"
             f" epoch={epoch}"
             f" n={n}"
@@ -433,7 +436,8 @@ class PCVRHyFormerRankingTrainer:
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
-                              dynamic_ncols=True)
+                              dynamic_ncols=True,
+                              disable=not self.show_progress_bar)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
@@ -455,6 +459,8 @@ class PCVRHyFormerRankingTrainer:
                     torch.cuda.empty_cache()
 
                     logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                    if self._last_eval_diagnostics_log:
+                        logging.info(self._last_eval_diagnostics_log)
 
                     if self.writer:
                         self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -474,6 +480,8 @@ class PCVRHyFormerRankingTrainer:
             torch.cuda.empty_cache()
 
             logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+            if self._last_eval_diagnostics_log:
+                logging.info(self._last_eval_diagnostics_log)
 
             if self.writer:
                 self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -578,7 +586,8 @@ class PCVRHyFormerRankingTrainer:
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader),
+                    disable=not self.show_progress_bar)
 
         all_logits_list = []
         all_labels_list = []
@@ -614,7 +623,8 @@ class PCVRHyFormerRankingTrainer:
         else:
             auc = float(roc_auc_score(labels_np, probs))
 
-        self._log_eval_diagnostics(epoch, labels_np, logits_np, probs)
+        self._last_eval_diagnostics_log = self._build_eval_diagnostics_log(
+            epoch, labels_np, logits_np, probs)
 
         # Binary logloss (same NaN filtering).
         valid_logits = all_logits[~torch.isnan(all_logits)]

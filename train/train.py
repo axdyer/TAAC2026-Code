@@ -85,6 +85,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--allow_tf32', action='store_true', default=False,
                         help='Enable CUDA TF32 matmul/cuDNN kernels for additional speed. '
                              'This is explicit because it changes fp32 numerics.')
+    parser.add_argument('--show_progress_bar', action='store_true', default=False,
+                        help='Show tqdm progress bars for train/eval loops. '
+                             'Disabled by default to keep platform logs compact.')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -384,6 +387,7 @@ def main() -> None:
         amp_dtype=args.amp_dtype,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
+        show_progress_bar=args.show_progress_bar,
     )
 
     trainer.train()
