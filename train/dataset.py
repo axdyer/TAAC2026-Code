@@ -16,6 +16,7 @@ import logging
 import random
 import json
 import gc
+import math
 
 import numpy as np
 import pyarrow as pa
@@ -132,6 +133,27 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Finer-grained time-delta bucket boundaries for ablation.
+# More granular in the first few minutes (where most behaviours concentrate).
+FINE_BUCKET_BOUNDARIES = np.array([
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
+    70, 80, 90, 100, 110, 120,
+    150, 180, 210, 240, 270, 300,
+    360, 420, 480, 540, 600,
+    720, 840, 960, 1080, 1200,
+    1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
+    4500, 5400, 6300, 7200, 8100, 9000, 9900, 10800,
+    12600, 14400, 16200, 18000, 19800, 21600,
+    25200, 28800, 32400, 36000, 39600, 43200,
+    54000, 64800, 75600, 86400,
+    172800, 259200, 345600, 432000, 518400, 604800,
+    1209600, 1814400, 2419200,
+    2592000, 5184000, 7776000, 15552000, 31536000,
+], dtype=np.int64)
+
+NUM_FINE_TIME_BUCKETS = len(FINE_BUCKET_BOUNDARIES) + 1
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -157,6 +179,10 @@ class PCVRParquetDataset(IterableDataset):
         known_num_rows: Optional[int] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_hour_encoding: bool = False,
+        use_user_time_stats: bool = False,
+        use_fine_time_buckets: bool = False,
+        use_time_decay_attn: bool = False,
     ) -> None:
         """
         Args:
@@ -180,6 +206,12 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_hour_encoding: add sin/cos hour-of-day (Beijing time) to user_dense.
+            use_user_time_stats: add per-sequence-domain recency / time_span /
+                frequency stats to user_dense.
+            use_fine_time_buckets: use finer-grained time-delta bucket boundaries.
+            use_time_decay_attn: store per-position time_diff for the model-side
+                time-decay attention gating.
         """
         super().__init__()
 
@@ -210,6 +242,11 @@ class PCVRParquetDataset(IterableDataset):
             timestamp_min is not None or timestamp_max is not None
         )
         self._known_num_rows = known_num_rows is not None
+        # Time feature flags.
+        self.use_hour_encoding = use_hour_encoding
+        self.use_user_time_stats = use_user_time_stats
+        self.use_fine_time_buckets = use_fine_time_buckets
+        self.use_time_decay_attn = use_time_decay_attn
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -233,6 +270,16 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        # ---- Expand user_dense for time-derived features ----
+        self._extra_dense_dim = 0
+        if self.use_hour_encoding:
+            self._extra_dense_dim += 2  # sin(hour), cos(hour)
+        if self.use_user_time_stats:
+            # 4 sequence domains * 3 stats (recency, time_span, frequency)
+            self._extra_dense_dim += len(self.seq_domains) * 3
+        if self._extra_dense_dim > 0:
+            self.user_dense_schema.total_dim += self._extra_dense_dim
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -643,19 +690,28 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
-        result = {
-            'user_int_feats': torch.from_numpy(user_int.copy()),
-            'user_dense_feats': torch.from_numpy(user_dense.copy()),
-            'item_int_feats': torch.from_numpy(item_int.copy()),
-            'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
-            'label': torch.from_numpy(labels),
-            'timestamp': torch.from_numpy(timestamps),
-            'user_id': user_ids,
-            '_seq_domains': self.seq_domains,
-        }
+        # ---- time-derived user_dense features ----
+        extra_off = self.user_dense_schema.total_dim - self._extra_dense_dim
+        if self.use_hour_encoding:
+            # Beijing time hour-of-day sin/cos encoding.
+            hour_bj = ((timestamps + 8 * 3600) // 3600) % 24
+            hour_rad = hour_bj.astype(np.float32) * (2.0 * math.pi / 24.0)
+            user_dense[:, extra_off] = np.sin(hour_rad)
+            user_dense[:, extra_off + 1] = np.cos(hour_rad)
+            extra_off += 2
+
+        # We defer the per-domain time stats until after we parse the sequence
+        # timestamps below; fill with zeros for now and patch after the loop.
+        _user_time_stats_off = extra_off if self.use_user_time_stats else -1
+
+        # Sequence data accumulators (filled during the loop below).
+        seq_data_dict: Dict[str, torch.Tensor] = {}
+        seq_lens_dict: Dict[str, torch.Tensor] = {}
+        seq_tb_dict: Dict[str, torch.Tensor] = {}
+        seq_td_dict: Dict[str, torch.Tensor] = {}
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        for domain in self.seq_domains:
+        for _domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
@@ -697,8 +753,8 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     slice_c[:] = 0
 
-            result[domain] = torch.from_numpy(out.copy())
-            result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
+            seq_data_dict[domain] = torch.from_numpy(out.copy())
+            seq_lens_dict[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
@@ -720,24 +776,65 @@ class PCVRParquetDataset(IterableDataset):
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
-                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
-                # the upper bound only appears when time_diff exceeds the
-                # largest boundary (~1 year) and would index past
-                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
-                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
-                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
-                # and is always a valid Embedding index. Time-diffs beyond the
-                # largest boundary collapse into the last bucket.
+
+                # Choose bucket boundaries based on flag.
+                boundaries = FINE_BUCKET_BOUNDARIES if self.use_fine_time_buckets else BUCKET_BOUNDARIES
+                n_boundaries = len(boundaries)
                 raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
+                    np.searchsorted(boundaries, time_diff.ravel()),
+                    0, n_boundaries - 1,
                 )
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
-            result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+                # Per-domain user time stats (recency / time_span / frequency).
+                if self.use_user_time_stats:
+                    stat_off = _user_time_stats_off + _domain_idx * 3
+                    for i in range(B):
+                        row_ts = ts_padded[i]
+                        valid = row_ts[row_ts > 0]
+                        if len(valid) == 0:
+                            continue
+                        # recency: log1p of (now - most_recent) in hours
+                        recency_sec = max(float(timestamps[i] - valid.max()), 0.0)
+                        user_dense[i, stat_off] = np.log1p(recency_sec / 3600.0)
+                        if len(valid) >= 2:
+                            # time_span: log1p of (max - min) in hours
+                            span_sec = max(float(valid.max() - valid.min()), 0.0)
+                            user_dense[i, stat_off + 1] = np.log1p(span_sec / 3600.0)
+                            # frequency: log1p of events per hour
+                            freq = len(valid) / max(span_sec, 1.0) * 3600.0
+                            user_dense[i, stat_off + 2] = np.log1p(freq)
+
+                # Store raw time_diff for model-side time-decay attention gating.
+                if self.use_time_decay_attn:
+                    seq_td_dict[f'{domain}_time_diff'] = torch.from_numpy(
+                        time_diff.astype(np.float32).copy())
+            elif self.use_time_decay_attn:
+                # No timestamp column for this domain → zero time_diff.
+                seq_td_dict[f'{domain}_time_diff'] = torch.zeros(
+                    B, max_len, dtype=torch.float32)
+
+            # Time bucket tensor (always stored).
+            seq_tb_dict[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+
+        # ---- Assemble result dict (after time stats have been written to user_dense) ----
+        result = {
+            'user_int_feats': torch.from_numpy(user_int.copy()),
+            'user_dense_feats': torch.from_numpy(user_dense.copy()),
+            'item_int_feats': torch.from_numpy(item_int.copy()),
+            'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
+            'label': torch.from_numpy(labels),
+            'timestamp': torch.from_numpy(timestamps),
+            'user_id': user_ids,
+            '_seq_domains': self.seq_domains,
+        }
+        # Merge sequence data, lengths, time buckets, time diffs.
+        result.update(seq_data_dict)
+        result.update(seq_lens_dict)
+        result.update(seq_tb_dict)
+        result.update(seq_td_dict)
 
         return result
 
@@ -748,7 +845,7 @@ def get_pcvr_data(
     batch_size: int = 256,
     valid_ratio: float = 0.1,
     train_ratio: float = 1.0,
-    split_mode: str = 'timestamp',
+    split_mode: str = 'rowgroup',
     num_workers: int = 16,
     prefetch_factor: int = 2,
     buffer_batches: int = 20,
@@ -828,6 +925,13 @@ def get_pcvr_data(
             f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
             f"{n_valid_rgs} valid ({valid_rows} rows)")
 
+    # Extract time feature flags forwarded via **kwargs from train.py.
+    _time_feature_keys = (
+        'use_hour_encoding', 'use_user_time_stats',
+        'use_fine_time_buckets', 'use_time_decay_attn',
+    )
+    _time_feature_flags = {k: kwargs.get(k, False) for k in _time_feature_keys}
+
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -839,6 +943,7 @@ def get_pcvr_data(
         timestamp_max=train_timestamp_max,
         known_num_rows=train_rows if split_mode == 'timestamp' else None,
         clip_vocab=clip_vocab,
+        **_time_feature_flags,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -863,6 +968,7 @@ def get_pcvr_data(
         timestamp_min=valid_timestamp_min,
         known_num_rows=valid_rows if split_mode == 'timestamp' else None,
         clip_vocab=clip_vocab,
+        **_time_feature_flags,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

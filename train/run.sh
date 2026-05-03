@@ -20,6 +20,16 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
     --prefetch_factor 4 \
     "$@"
 
+# ---- Time feature ablation switches (append to the command above via "$@") ----
+#   --use_hour_encoding        # Beijing-time hour-of-day sin/cos → user_dense
+#   --use_user_time_stats      # Per-sequence recency/time_span/frequency → user_dense
+#   --use_fine_time_buckets    # 88 finer-grained time-delta buckets (vs baseline 64)
+#   --use_time_decay_attn      # Learnable multiplicative time-decay gating on seq tokens
+#
+# Example: combine all four:
+#   bash run.sh --use_hour_encoding --use_user_time_stats \
+#               --use_fine_time_buckets --use_time_decay_attn
+
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).
 # With d_model=64 and num_ns=12 (7 user_int + 1 user_dense + 4 item_int),

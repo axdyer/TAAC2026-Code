@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, NUM_FINE_TIME_BUCKETS
 from model import PCVRHyFormer, ModelInput
 
 
@@ -68,6 +68,7 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'use_time_decay_attn': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -128,12 +129,14 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
 
     Special handling for ``num_time_buckets``: it is not exposed on the CLI
     as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    by the length of the bucket boundaries array. Resolution order:
 
       1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
          -> use that value;
       2) ``train_config`` contains ``use_time_buckets`` (new-style training)
-         -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
+         -> if ``use_fine_time_buckets``: ``NUM_FINE_TIME_BUCKETS``;
+            elif ``use_time_buckets``: ``NUM_TIME_BUCKETS``;
+            else: 0;
       3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
     """
     cfg: Dict[str, Any] = {}
@@ -142,7 +145,12 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
             if 'num_time_buckets' in train_config:
                 cfg[key] = train_config['num_time_buckets']
             elif 'use_time_buckets' in train_config:
-                cfg[key] = NUM_TIME_BUCKETS if train_config['use_time_buckets'] else 0
+                if train_config.get('use_fine_time_buckets', False):
+                    cfg[key] = NUM_FINE_TIME_BUCKETS
+                elif train_config['use_time_buckets']:
+                    cfg[key] = NUM_TIME_BUCKETS
+                else:
+                    cfg[key] = 0
             else:
                 cfg[key] = _FALLBACK_MODEL_CFG[key]
                 logging.warning(
@@ -284,6 +292,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_time_diffs: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -291,6 +300,9 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_time_diffs[domain] = device_batch.get(
+            f'{domain}_time_diff',
+            torch.zeros(B, L, dtype=torch.float32, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -300,6 +312,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_time_diffs=seq_time_diffs,
     )
 
 
@@ -340,7 +353,12 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        use_hour_encoding=train_config.get('use_hour_encoding', False),
+        use_user_time_stats=train_config.get('use_user_time_stats', False),
+        use_fine_time_buckets=train_config.get('use_fine_time_buckets', False),
+        use_time_decay_attn=train_config.get('use_time_decay_attn', False),
     )
+    logging.info(f"use_hour_encoding: {test_dataset.use_hour_encoding}, use_user_time_stats: {test_dataset.use_user_time_stats}, use_fine_time_buckets: {test_dataset.use_fine_time_buckets}, use_time_decay_attn: {test_dataset.use_time_decay_attn}")
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
 
