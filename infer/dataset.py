@@ -863,6 +863,10 @@ def get_pcvr_data(
         ``timestamp >= cutoff`` are validation.
       - ``rowgroup``: reproduce the baseline behavior, using the tail
         ``valid_ratio`` fraction of Row Groups as validation.
+      - ``rowgroupinterval``: iterate over ALL row groups, keeping only rows
+        whose ``timestamp`` falls inside ``[time_range_start, time_range_end)``.
+        The same time filter applies to both train and valid (no data split).
+        Requires ``time_range`` in kwargs as ``(start_ts, end_ts)``.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -871,11 +875,25 @@ def get_pcvr_data(
         the model.
     """
     random.seed(seed)
-    if not (0.0 < valid_ratio < 1.0):
-        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
-    if split_mode not in ('timestamp', 'rowgroup'):
+    if split_mode == 'rowgroupinterval':
+        time_range = kwargs.get('time_range', None)
+        if time_range is None or len(time_range) != 2:
+            raise ValueError(
+                "split_mode='rowgroupinterval' requires --time_range START,END "
+                "(two Unix timestamps)")
+        time_range_start, time_range_end = int(time_range[0]), int(time_range[1])
+        if time_range_start >= time_range_end:
+            raise ValueError(
+                f"time_range start must be < end, got {time_range_start} >= {time_range_end}")
+        # No valid_ratio / train_ratio check for this mode.
+    else:
+        time_range = None
+        if not (0.0 < valid_ratio < 1.0):
+            raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    if split_mode not in ('timestamp', 'rowgroup', 'rowgroupinterval'):
         raise ValueError(
-            f"split_mode must be either 'timestamp' or 'rowgroup', got {split_mode!r}")
+            f"split_mode must be one of 'timestamp', 'rowgroup', 'rowgroupinterval', "
+            f"got {split_mode!r}")
     if split_mode == 'timestamp' and train_ratio < 1.0:
         raise ValueError(
             "--train_ratio < 1.0 is only supported with --split_mode rowgroup. "
@@ -906,6 +924,19 @@ def get_pcvr_data(
         )
         train_timestamp_max = timestamp_cutoff
         valid_timestamp_min = timestamp_cutoff
+    elif split_mode == 'rowgroupinterval':
+        # Split row groups the same way as 'rowgroup', then apply the time-range
+        # filter to every batch on top of that.
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_row_group_range = (0, n_train_rgs)
+        valid_row_group_range = (n_train_rgs, total_rgs)
+        # Both splits apply the same [start, end) timestamp filter.
+        train_timestamp_max = time_range_end
+        valid_timestamp_min = time_range_start
+        timestamp_cutoff = None
     else:
         n_valid_rgs = max(1, int(total_rgs * valid_ratio))
         n_train_rgs = total_rgs - n_valid_rgs
@@ -940,8 +971,9 @@ def get_pcvr_data(
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
         row_group_range=train_row_group_range,
+        timestamp_min=valid_timestamp_min if split_mode == 'rowgroupinterval' else None,
         timestamp_max=train_timestamp_max,
-        known_num_rows=train_rows if split_mode == 'timestamp' else None,
+        known_num_rows=train_rows if split_mode in ('timestamp',) else None,
         clip_vocab=clip_vocab,
         **_time_feature_flags,
     )
@@ -966,6 +998,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=valid_row_group_range,
         timestamp_min=valid_timestamp_min,
+        timestamp_max=train_timestamp_max if split_mode == 'rowgroupinterval' else None,
         known_num_rows=valid_rows if split_mode == 'timestamp' else None,
         clip_vocab=clip_vocab,
         **_time_feature_flags,
@@ -975,10 +1008,18 @@ def get_pcvr_data(
         num_workers=0, pin_memory=use_cuda,
     )
 
-    logging.info(f"Parquet split_mode={split_mode}, train: {train_rows} rows, "
-                 f"valid: {valid_rows} rows, timestamp_cutoff={timestamp_cutoff}, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
-                 f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
+    if split_mode == 'rowgroupinterval':
+        logging.info(
+            f"Parquet split_mode={split_mode}, "
+            f"time_range=[{time_range_start}, {time_range_end}), "
+            f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
+            f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
+    else:
+        logging.info(
+            f"Parquet split_mode={split_mode}, train: {train_rows} rows, "
+            f"valid: {valid_rows} rows, timestamp_cutoff={timestamp_cutoff}, "
+            f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
+            f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
 
     return train_loader, valid_loader, train_dataset
 

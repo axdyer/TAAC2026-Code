@@ -98,16 +98,22 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--split_mode', type=str, default='rowgroup',
-                        choices=['timestamp', 'rowgroup'],
+                        choices=['timestamp', 'rowgroup', 'rowgroupinterval'],
                         help='Train/valid split mode. timestamp = row-level time '
                              'split by timestamp, using the latest valid_ratio rows '
-                             'as validation; rowgroup = baseline tail Row Group split.')
+                             'as validation; rowgroup = baseline tail Row Group split; '
+                             'rowgroupinterval = filter all Row Groups to a time window '
+                             '(requires --time_range).')
     parser.add_argument('--train_ratio', type=float, default=1.0,
                         help='Fraction of training Row Groups to use in rowgroup split '
                              '(timestamp split requires this to stay at 1.0)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of data used for validation. timestamp split uses '
                              'the latest rows by timestamp; rowgroup split uses tail Row Groups.')
+    parser.add_argument('--time_range', type=int, nargs=2, default=None,
+                        metavar=('START', 'END'),
+                        help='Time range filter (Unix timestamps) for split_mode=rowgroupinterval. '
+                             'Rows with START <= timestamp < END are kept.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -307,6 +313,7 @@ def main() -> None:
         use_user_time_stats=args.use_user_time_stats,
         use_fine_time_buckets=args.use_fine_time_buckets,
         use_time_decay_attn=args.use_time_decay_attn,
+        time_range=args.time_range,
     )
 
     # ---- NS groups ----
