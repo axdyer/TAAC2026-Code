@@ -57,6 +57,8 @@ def parse_user_feat_pair(value: str) -> List[int]:
     result: List[int] = []
     seen = set()
     for fid in fids:
+        if isinstance(fid, bool):
+            raise ValueError(f"--user_feat_pair contains non-integer fid: {fid!r}")
         if not isinstance(fid, int):
             if not isinstance(fid, str) or not fid.isdigit():
                 raise ValueError(f"--user_feat_pair contains non-integer fid: {fid!r}")
@@ -294,8 +296,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--user_feat_pair', type=str, default='',
                         help='Comma-separated or JSON list of user fids whose '
                              'aligned user_int/user_dense values should be paired '
-                             'and fused into the user_dense token, e.g. '
-                             "'62,63,64,65,66' or '[65,66]'. Empty disables it.")
+                             'and fused into the user_dense token. Supported fids: '
+                             'positive branch 62-66, signed branch 89-91, e.g. '
+                             "'62,63,64,65,66' or '[62,63,64,65,66,89,90,91]'. "
+                             'Empty disables it.')
 
     args = parser.parse_args()
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)

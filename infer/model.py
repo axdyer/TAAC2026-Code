@@ -20,6 +20,10 @@ class ModelInput(NamedTuple):
 
 
 SUPPORTED_POS_USER_PAIR_FIDS = {62, 63, 64, 65, 66}
+SUPPORTED_SIGNED_USER_PAIR_FIDS = {89, 90, 91}
+SUPPORTED_USER_PAIR_FIDS = (
+    SUPPORTED_POS_USER_PAIR_FIDS | SUPPORTED_SIGNED_USER_PAIR_FIDS
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1235,8 +1239,9 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # Time-decay attention gating
         use_time_decay_attn: bool = False,
-        # User int/dense element-wise pair features. The current branch handles
-        # the positive long-tail fids 62-66 and fuses them into user_dense_tok.
+        # User int/dense element-wise pair features. Positive long-tail fids
+        # 62-66 and signed fids 89-91 are modeled by separate branches and
+        # fused into user_dense_tok.
         user_feat_pair: Optional[List[int]] = None,
         user_int_feature_ids: Optional[List[int]] = None,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
@@ -1257,7 +1262,19 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_time_decay_attn = use_time_decay_attn
         self.user_feat_pair = list(user_feat_pair or [])
+        if len(set(self.user_feat_pair)) != len(self.user_feat_pair):
+            raise ValueError(f"user_feat_pair contains duplicate fids: {self.user_feat_pair}")
         self.has_user_feat_pair = len(self.user_feat_pair) > 0
+        self.user_pos_feat_pair = [
+            fid for fid in self.user_feat_pair
+            if fid in SUPPORTED_POS_USER_PAIR_FIDS
+        ]
+        self.user_signed_feat_pair = [
+            fid for fid in self.user_feat_pair
+            if fid in SUPPORTED_SIGNED_USER_PAIR_FIDS
+        ]
+        self.has_user_pos_pair = len(self.user_pos_feat_pair) > 0
+        self.has_user_signed_pair = len(self.user_signed_feat_pair) > 0
 
         # ================== NS Tokens Construction ==================
 
@@ -1318,20 +1335,21 @@ class PCVRHyFormer(nn.Module):
             )
 
         # ================== User Int/Dense Pair Fusion ==================
-        self.user_pair_specs: List[Tuple[int, int, int, int, int]] = []
+        self.user_pos_pair_specs: List[Tuple[int, int, int, int, int]] = []
+        self.user_signed_pair_specs: List[Tuple[int, int, int, int, int]] = []
         if self.has_user_feat_pair:
             if not self.has_user_dense:
                 raise ValueError("user_feat_pair requires user_dense_dim > 0")
             unsupported = [
                 fid for fid in self.user_feat_pair
-                if fid not in SUPPORTED_POS_USER_PAIR_FIDS
+                if fid not in SUPPORTED_USER_PAIR_FIDS
             ]
             if unsupported:
                 raise ValueError(
-                    "The current user_feat_pair implementation supports only "
-                    f"positive long-tail fids {sorted(SUPPORTED_POS_USER_PAIR_FIDS)}; "
-                    f"got unsupported fids {unsupported}. Add a signed-pair "
-                    "branch before enabling fids such as 89/90/91."
+                    "user_feat_pair supports only positive long-tail fids "
+                    f"{sorted(SUPPORTED_POS_USER_PAIR_FIDS)} and signed fids "
+                    f"{sorted(SUPPORTED_SIGNED_USER_PAIR_FIDS)}; got unsupported "
+                    f"fids {unsupported}."
                 )
             if user_int_feature_ids is None:
                 raise ValueError("user_int_feature_ids must be provided when user_feat_pair is non-empty")
@@ -1348,42 +1366,73 @@ class PCVRHyFormer(nn.Module):
                 int(fid): (int(offset), int(length))
                 for fid, offset, length in user_dense_feature_specs
             }
-            pair_embs = []
-            pair_norms = []
-            for fid in self.user_feat_pair:
-                if fid not in int_idx_by_fid:
-                    raise ValueError(f"user_feat_pair fid {fid} not found in user_int schema")
-                if fid not in dense_by_fid:
-                    raise ValueError(f"user_feat_pair fid {fid} not found in user_dense schema")
-                vs, int_offset, int_len = user_int_feature_specs[int_idx_by_fid[fid]]
-                dense_offset, dense_len = dense_by_fid[fid]
-                if int_len != dense_len:
-                    raise ValueError(
-                        f"user_feat_pair fid {fid} int length {int_len} "
-                        f"!= dense length {dense_len}"
-                    )
-                if int(vs) <= 0:
-                    raise ValueError(f"user_feat_pair fid {fid} has invalid vocab_size={vs}")
-                self.user_pair_specs.append((
-                    int(fid), int(vs), int(int_offset), int(dense_offset), int(int_len)
-                ))
-                # +2 because 0 is reserved for padding and raw id=0 is kept as
-                # a valid category via shifted_ids = raw_id + 1.
-                pair_embs.append(nn.Embedding(int(vs) + 2, emb_dim, padding_idx=0))
-                pair_norms.append(nn.LayerNorm(emb_dim))
 
-            self.user_pair_embs = nn.ModuleList(pair_embs)
-            self.user_pair_norms = nn.ModuleList(pair_norms)
-            self.user_pair_proj = nn.Sequential(
-                nn.Linear(len(self.user_pair_specs) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
-            )
+            def _build_pair_branch(
+                fids: List[int],
+            ) -> Tuple[
+                List[Tuple[int, int, int, int, int]],
+                List[nn.Embedding],
+                List[nn.LayerNorm],
+            ]:
+                branch_specs: List[Tuple[int, int, int, int, int]] = []
+                branch_embs: List[nn.Embedding] = []
+                branch_norms: List[nn.LayerNorm] = []
+                for fid in fids:
+                    if fid not in int_idx_by_fid:
+                        raise ValueError(f"user_feat_pair fid {fid} not found in user_int schema")
+                    if fid not in dense_by_fid:
+                        raise ValueError(f"user_feat_pair fid {fid} not found in user_dense schema")
+                    vs, int_offset, int_len = user_int_feature_specs[int_idx_by_fid[fid]]
+                    dense_offset, dense_len = dense_by_fid[fid]
+                    if int_len != dense_len:
+                        raise ValueError(
+                            f"user_feat_pair fid {fid} int length {int_len} "
+                            f"!= dense length {dense_len}"
+                        )
+                    if int(vs) <= 0:
+                        raise ValueError(f"user_feat_pair fid {fid} has invalid vocab_size={vs}")
+                    branch_specs.append((
+                        int(fid), int(vs), int(int_offset), int(dense_offset), int(int_len)
+                    ))
+                    # +2 because 0 is reserved for padding and raw id=0 is kept
+                    # as a valid category via shifted_ids = raw_id + 1.
+                    branch_embs.append(nn.Embedding(int(vs) + 2, emb_dim, padding_idx=0))
+                    branch_norms.append(nn.LayerNorm(emb_dim))
+                return branch_specs, branch_embs, branch_norms
+
+            pos_pair_embs: List[nn.Embedding] = []
+            pos_pair_norms: List[nn.LayerNorm] = []
+            signed_pair_embs: List[nn.Embedding] = []
+            signed_pair_norms: List[nn.LayerNorm] = []
+            if self.has_user_pos_pair:
+                self.user_pos_pair_specs, pos_pair_embs, pos_pair_norms = (
+                    _build_pair_branch(self.user_pos_feat_pair)
+                )
+                self.user_pos_pair_embs = nn.ModuleList(pos_pair_embs)
+                self.user_pos_pair_norms = nn.ModuleList(pos_pair_norms)
+                self.user_pos_pair_proj = nn.Sequential(
+                    nn.Linear(len(self.user_pos_pair_specs) * emb_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                self.user_pos_pair_gate = nn.Parameter(torch.tensor(0.1))
+
+            if self.has_user_signed_pair:
+                self.user_signed_pair_specs, signed_pair_embs, signed_pair_norms = (
+                    _build_pair_branch(self.user_signed_feat_pair)
+                )
+                self.user_signed_pair_embs = nn.ModuleList(signed_pair_embs)
+                self.user_signed_pair_norms = nn.ModuleList(signed_pair_norms)
+                self.user_signed_pair_proj = nn.Sequential(
+                    nn.Linear(len(self.user_signed_pair_specs) * emb_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                self.user_signed_pair_gate = nn.Parameter(torch.tensor(0.1))
+
             self.user_dense_pair_norm = nn.LayerNorm(d_model)
-            self.user_pair_scale = nn.Parameter(torch.tensor(0.1))
             logging.info(
                 f"User int/dense pair fusion enabled for fids={self.user_feat_pair}; "
-                "using shifted-id embeddings, log1p positive dense weights, "
-                "and normalized weighted pooling into user_dense_tok"
+                f"positive_branch={self.user_pos_feat_pair}, "
+                f"signed_branch={self.user_signed_feat_pair}"
             )
 
         # Item dense feature projection (if available)
@@ -1556,8 +1605,13 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
-        if self.has_user_feat_pair:
-            for emb in self.user_pair_embs:
+        if self.has_user_pos_pair:
+            for emb in self.user_pos_pair_embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
+        if self.has_user_signed_pair:
+            for emb in self.user_signed_pair_embs:
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
@@ -1618,8 +1672,18 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        if self.has_user_feat_pair:
-            for emb, (fid, vs, _, _, _) in zip(self.user_pair_embs, self.user_pair_specs):
+        if self.has_user_pos_pair:
+            for emb, (fid, vs, _, _, _) in zip(self.user_pos_pair_embs, self.user_pos_pair_specs):
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        if self.has_user_signed_pair:
+            for emb, (fid, vs, _, _, _) in zip(self.user_signed_pair_embs, self.user_signed_pair_specs):
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
                     emb.weight.data[0, :] = 0
@@ -1649,34 +1713,69 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
-    def _embed_user_feat_pairs(
+    def _pool_user_pair_branch(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+        pair_embs: nn.ModuleList,
+        pair_norms: nn.ModuleList,
+        pair_specs: List[Tuple[int, int, int, int, int]],
+        signed: bool,
+    ) -> torch.Tensor:
+        """Build a branch token from aligned user int/dense fids."""
+        pair_vecs = []
+        for emb, norm, (_, _, int_offset, dense_offset, length) in zip(pair_embs, pair_norms, pair_specs):
+            ids = user_int_feats[:, int_offset:int_offset + length].long()
+            vals = user_dense_feats[:, dense_offset:dense_offset + length].float()
+            if signed:
+                valid = vals != 0
+                weights = vals.clamp(min=-10.0, max=10.0).unsqueeze(-1)
+                weights = weights * valid.float().unsqueeze(-1)
+                denom = weights.abs().sum(dim=1).clamp_min(1.0)
+            else:
+                valid = vals > 0
+                weights = torch.log1p(vals.clamp_min(0.0)).unsqueeze(-1)
+                weights = weights * valid.float().unsqueeze(-1)
+                denom = weights.sum(dim=1).clamp_min(1.0)
+            shifted_ids = ids + 1
+            shifted_ids = torch.where(valid, shifted_ids, torch.zeros_like(shifted_ids))
+            emb_all = emb(shifted_ids)  # (B, L, E)
+            pair_vec = (emb_all * weights).sum(dim=1) / denom
+            pair_vecs.append(norm(pair_vec))
+        pair_concat = torch.cat(pair_vecs, dim=-1)
+        if signed:
+            return self.user_signed_pair_proj(pair_concat)
+        return self.user_pos_pair_proj(pair_concat)
+
+    def _embed_user_pos_feat_pairs(
         self,
         user_int_feats: torch.Tensor,
         user_dense_feats: torch.Tensor,
     ) -> torch.Tensor:
-        """Build a single pair token from aligned user int/dense fids.
+        """Build a positive long-tail pair token for fids 62-66."""
+        return self._pool_user_pair_branch(
+            user_int_feats=user_int_feats,
+            user_dense_feats=user_dense_feats,
+            pair_embs=self.user_pos_pair_embs,
+            pair_norms=self.user_pos_pair_norms,
+            pair_specs=self.user_pos_pair_specs,
+            signed=False,
+        )
 
-        For positive long-tail fids 62-66, dense values are transformed with
-        log1p and used as weights over shifted id embeddings. Raw id=0 is kept
-        as a valid category; padding positions are detected by dense value <= 0.
-        """
-        pair_vecs = []
-        for emb, norm, (_, _, int_offset, dense_offset, length) in zip(
-            self.user_pair_embs, self.user_pair_norms, self.user_pair_specs
-        ):
-            ids = user_int_feats[:, int_offset:int_offset + length].long()
-            vals = user_dense_feats[:, dense_offset:dense_offset + length].float()
-            valid = vals > 0
-            shifted_ids = ids + 1
-            shifted_ids = torch.where(valid, shifted_ids, torch.zeros_like(shifted_ids))
-            emb_all = emb(shifted_ids)  # (B, L, E)
-            weights = torch.log1p(vals.clamp_min(0.0)).unsqueeze(-1)
-            weights = weights * valid.float().unsqueeze(-1)
-            denom = weights.sum(dim=1).clamp_min(1.0)
-            pair_vec = (emb_all * weights).sum(dim=1) / denom
-            pair_vecs.append(norm(pair_vec))
-        pair_concat = torch.cat(pair_vecs, dim=-1)
-        return self.user_pair_proj(pair_concat)
+    def _embed_user_signed_feat_pairs(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build a signed pair token for fids 89-91."""
+        return self._pool_user_pair_branch(
+            user_int_feats=user_int_feats,
+            user_dense_feats=user_dense_feats,
+            pair_embs=self.user_signed_pair_embs,
+            pair_norms=self.user_signed_pair_norms,
+            pair_specs=self.user_signed_pair_specs,
+            signed=True,
+        )
 
     def _make_user_dense_token(
         self,
@@ -1685,10 +1784,16 @@ class PCVRHyFormer(nn.Module):
     ) -> torch.Tensor:
         user_dense_base = self.user_dense_proj(user_dense_feats)
         if self.has_user_feat_pair:
-            pair_token = self._embed_user_feat_pairs(user_int_feats, user_dense_feats)
-            user_dense_base = self.user_dense_pair_norm(
-                user_dense_base + self.user_pair_scale * pair_token
-            )
+            fused = user_dense_base
+            if self.has_user_pos_pair:
+                pos_pair_token = self._embed_user_pos_feat_pairs(
+                    user_int_feats, user_dense_feats)
+                fused = fused + self.user_pos_pair_gate * pos_pair_token
+            if self.has_user_signed_pair:
+                signed_pair_token = self._embed_user_signed_feat_pairs(
+                    user_int_feats, user_dense_feats)
+                fused = fused + self.user_signed_pair_gate * signed_pair_token
+            user_dense_base = self.user_dense_pair_norm(fused)
         return F.silu(user_dense_base).unsqueeze(1)
 
     def _embed_seq_domain(
