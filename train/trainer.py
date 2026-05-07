@@ -7,6 +7,7 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 import os
 import shutil
 import logging
+import math
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -48,6 +49,11 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        use_time_sample_weight: bool = False,
+        time_weight_ref_timestamp: int = 0,
+        time_weight_half_life_hours: float = 3.0,
+        time_weight_min: float = 0.05,
+        time_weight_max: float = 3.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -116,6 +122,27 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.use_time_sample_weight: bool = use_time_sample_weight
+        self.time_weight_ref_timestamp: int = time_weight_ref_timestamp
+        self.time_weight_half_life_hours: float = time_weight_half_life_hours
+        self.time_weight_min: float = time_weight_min
+        self.time_weight_max: float = time_weight_max
+        if self.use_time_sample_weight:
+            if self.time_weight_ref_timestamp <= 0:
+                raise ValueError(
+                    "time_weight_ref_timestamp must be positive when "
+                    "use_time_sample_weight=True"
+                )
+            if self.time_weight_half_life_hours <= 0:
+                raise ValueError("time_weight_half_life_hours must be > 0")
+            if self.time_weight_min <= 0:
+                raise ValueError("time_weight_min must be > 0")
+            if self.time_weight_max < self.time_weight_min:
+                raise ValueError("time_weight_max must be >= time_weight_min")
+        self._time_weight_decay: float = (
+            math.log(2.0) / self.time_weight_half_life_hours
+            if self.use_time_sample_weight else 0.0
+        )
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -132,6 +159,16 @@ class PCVRHyFormerRankingTrainer:
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_dtype={amp_dtype}, compile_model={compile_model}, "
                      f"show_progress_bar={show_progress_bar}")
+        if self.use_time_sample_weight:
+            logging.info(
+                "Time sample weighting enabled: ref_timestamp=%s, "
+                "half_life_hours=%s, min=%s, max=%s, formula="
+                "min + (max-min)*exp(-ln2*age_hours/half_life)",
+                self.time_weight_ref_timestamp,
+                self.time_weight_half_life_hours,
+                self.time_weight_min,
+                self.time_weight_max,
+            )
 
     @staticmethod
     def _resolve_amp_dtype(amp_dtype: str, device: str) -> Optional[torch.dtype]:
@@ -552,10 +589,64 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
+    def _make_time_sample_weights(
+        self,
+        cpu_batch: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        """Build fixed recency weights for a CPU batch.
+
+        The weight curve is monotonic in timestamp recency:
+
+        ``w = min + (max - min) * exp(-ln(2) * age_hours / half_life)``.
+
+        ``age_hours`` is measured from ``time_weight_ref_timestamp``. Samples
+        after the reference timestamp are rejected because they indicate a
+        misconfigured cutoff.
+        """
+        if not self.use_time_sample_weight:
+            return None
+        if 'timestamp' not in cpu_batch:
+            raise KeyError(
+                "Batch does not contain 'timestamp'; time sample weighting "
+                "requires the training dataset to return timestamp"
+            )
+        timestamps = cpu_batch['timestamp']
+        if not isinstance(timestamps, torch.Tensor):
+            raise TypeError(
+                "Batch field 'timestamp' must be a torch.Tensor when time "
+                f"sample weighting is enabled, got {type(timestamps)!r}"
+            )
+        if timestamps.numel() == 0:
+            raise ValueError("Cannot build time sample weights for an empty batch")
+
+        max_ts = int(timestamps.max().item())
+        if max_ts > self.time_weight_ref_timestamp:
+            raise ValueError(
+                "Found training sample timestamp later than "
+                f"time_weight_ref_timestamp: max_batch_timestamp={max_ts}, "
+                f"ref_timestamp={self.time_weight_ref_timestamp}. Set a later "
+                "--time_weight_ref_timestamp or disable --use_time_sample_weight."
+            )
+
+        age_seconds = (
+            self.time_weight_ref_timestamp - timestamps.to(torch.int64)
+        ).to(torch.float32)
+        age_hours = age_seconds / 3600.0
+        decay = torch.exp(-self._time_weight_decay * age_hours)
+        weights = (
+            self.time_weight_min
+            + (self.time_weight_max - self.time_weight_min) * decay
+        )
+        return weights
+
     def _train_step(self, batch: Dict[str, Any]) -> float:
         """Run a single training step and return the scalar loss value."""
+        sample_weights = self._make_time_sample_weights(batch)
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
+        if sample_weights is not None:
+            sample_weights = sample_weights.to(
+                self.device, dtype=torch.float32, non_blocking=True)
 
         self.dense_optimizer.zero_grad(set_to_none=True)
         if self.sparse_optimizer is not None:
@@ -567,9 +658,19 @@ class PCVRHyFormerRankingTrainer:
             logits = logits.squeeze(-1)  # (B,)
 
             if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                loss_per_sample = sigmoid_focal_loss(
+                    logits, label, alpha=self.focal_alpha,
+                    gamma=self.focal_gamma, reduction='none')
             else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+                loss_per_sample = F.binary_cross_entropy_with_logits(
+                    logits, label, reduction='none')
+            if sample_weights is not None:
+                loss = (
+                    loss_per_sample
+                    * sample_weights.to(dtype=loss_per_sample.dtype)
+                ).mean()
+            else:
+                loss = loss_per_sample.mean()
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
