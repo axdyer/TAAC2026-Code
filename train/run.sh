@@ -30,12 +30,12 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 #   bash run.sh --use_hour_encoding --use_user_time_stats \
 #               --use_fine_time_buckets --use_time_decay_attn
 
-# ---- Time-range filter mode (split_mode=rowgroupinterval) ----
-# Filters ALL row groups to a [start, end) timestamp window.
-#   --split_mode rowgroupinterval --time_range START END
+# ---- Time-range filter mode (--interval) ----
+# After the train/valid split, further filter both sets to a [start, end) timestamp window.
+#   --interval --time_range START END
 #
-# Example: train only on March 21-23 data:
-#   bash run.sh --split_mode rowgroupinterval --time_range 1774080000 1774252800
+# Example: split by rowgroup, then keep only March 21-23 data:
+#   bash run.sh --split_mode rowgroup --interval --time_range 1774080000 1774252800
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).

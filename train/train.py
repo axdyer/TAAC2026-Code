@@ -98,22 +98,24 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--split_mode', type=str, default='rowgroup',
-                        choices=['timestamp', 'rowgroup', 'rowgroupinterval'],
+                        choices=['timestamp', 'rowgroup'],
                         help='Train/valid split mode. timestamp = row-level time '
                              'split by timestamp, using the latest valid_ratio rows '
-                             'as validation; rowgroup = baseline tail Row Group split; '
-                             'rowgroupinterval = filter all Row Groups to a time window '
-                             '(requires --time_range).')
+                             'as validation; rowgroup = baseline tail Row Group split.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
                         help='Fraction of training Row Groups to use in rowgroup split '
                              '(timestamp split requires this to stay at 1.0)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of data used for validation. timestamp split uses '
                              'the latest rows by timestamp; rowgroup split uses tail Row Groups.')
+    parser.add_argument('--interval', action='store_true', default=False,
+                        help='After the train/valid split, further filter both sets '
+                             'to only keep rows whose timestamp falls in --time_range. '
+                             'Requires --time_range START END.')
     parser.add_argument('--time_range', type=int, nargs=2, default=None,
                         metavar=('START', 'END'),
-                        help='Time range filter (Unix timestamps) for split_mode=rowgroupinterval. '
-                             'Rows with START <= timestamp < END are kept.')
+                        help='Time range filter (Unix timestamps), used when --interval '
+                             'is set. Rows with START <= timestamp < END are kept.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -275,6 +277,15 @@ def main() -> None:
     args = parse_args()
     if args.num_workers > 0 and args.prefetch_factor < 1:
         raise ValueError("--prefetch_factor must be >= 1 when --num_workers > 0")
+    if args.interval:
+        if args.time_range is None or len(args.time_range) != 2:
+            raise ValueError(
+                "--interval requires --time_range START END "
+                "(two Unix timestamps)")
+        if args.time_range[0] >= args.time_range[1]:
+            raise ValueError(
+                f"--time_range start must be < end, got "
+                f"{args.time_range[0]} >= {args.time_range[1]}")
     if args.use_time_sample_weight:
         if args.time_weight_ref_timestamp <= 0:
             raise ValueError(
@@ -344,6 +355,7 @@ def main() -> None:
         use_fine_time_buckets=args.use_fine_time_buckets,
         use_time_decay_attn=args.use_time_decay_attn,
         time_range=args.time_range,
+        interval=args.interval,
     )
 
     # ---- NS groups ----
