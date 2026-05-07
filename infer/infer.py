@@ -68,6 +68,7 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'user_feat_pair': [],
     'use_time_decay_attn': False,
 }
 
@@ -232,6 +233,8 @@ def build_model(
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
         item_int_feature_specs=item_int_feature_specs,
+        user_int_feature_ids=dataset.user_int_schema.feature_ids,
+        user_dense_feature_specs=dataset.user_dense_schema.entries,
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,

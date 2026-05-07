@@ -38,6 +38,36 @@ def build_feature_specs(
     return specs
 
 
+def parse_user_feat_pair(value: str) -> List[int]:
+    """Parse --user_feat_pair.
+
+    Accepts either ``62,63,64`` or a JSON-style list ``[62,63,64]``. The
+    empty string / ``[]`` disables the feature.
+    """
+    s = value.strip()
+    if not s or s == '[]':
+        return []
+    if s.startswith('['):
+        parsed = json.loads(s)
+        if not isinstance(parsed, list):
+            raise ValueError("--user_feat_pair JSON value must be a list")
+        fids = parsed
+    else:
+        fids = [p.strip() for p in s.split(',') if p.strip()]
+    result: List[int] = []
+    seen = set()
+    for fid in fids:
+        if not isinstance(fid, int):
+            if not isinstance(fid, str) or not fid.isdigit():
+                raise ValueError(f"--user_feat_pair contains non-integer fid: {fid!r}")
+            fid = int(fid)
+        if fid in seen:
+            raise ValueError(f"--user_feat_pair contains duplicate fid: {fid}")
+        seen.add(fid)
+        result.append(fid)
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -261,8 +291,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--user_feat_pair', type=str, default='',
+                        help='Comma-separated or JSON list of user fids whose '
+                             'aligned user_int/user_dense values should be paired '
+                             'and fused into the user_dense token, e.g. '
+                             "'62,63,64,65,66' or '[65,66]'. Empty disables it.")
 
     args = parser.parse_args()
+    args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -383,6 +419,8 @@ def main() -> None:
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
+        "user_int_feature_ids": pcvr_dataset.user_int_schema.feature_ids,
+        "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
@@ -412,6 +450,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "user_feat_pair": args.user_feat_pair,
         "use_time_decay_attn": args.use_time_decay_attn,
     }
 
