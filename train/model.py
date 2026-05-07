@@ -16,7 +16,6 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
-    seq_time_diffs: dict = {}  # {domain: tensor [B, L]} float32, seconds
 
 
 SUPPORTED_POS_USER_PAIR_FIDS = {62, 63, 64, 65, 66}
@@ -1237,8 +1236,6 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        # Time-decay attention gating
-        use_time_decay_attn: bool = False,
         # User int/dense element-wise pair features. Positive long-tail fids
         # 62-66 and signed fids 89-91 are modeled by separate branches and
         # fused into user_dense_tok.
@@ -1260,7 +1257,6 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
-        self.use_time_decay_attn = use_time_decay_attn
         self.user_feat_pair = list(user_feat_pair or [])
         if len(set(self.user_feat_pair)) != len(self.user_feat_pair):
             raise ValueError(f"user_feat_pair contains duplicate fids: {self.user_feat_pair}")
@@ -1508,16 +1504,6 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
-
-        # ================== Time-Decay Attention Gating (optional) ==================
-        # Per-domain learnable decay rate (in units of 1/hour).
-        # gate = exp(-decay_rate * time_diff_in_hours)
-        if self.use_time_decay_attn:
-            self.time_decay_rates = nn.ParameterList([
-                nn.Parameter(torch.full((1,), 0.5))  # init: exp(-0.5*t) ≈ 0.6 after 1 hour
-                for _ in self.seq_domains
-            ])
-            self.time_decay_scale = nn.Parameter(torch.full((1,), 1.0 / 3600.0))
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1804,8 +1790,6 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
-        time_diff: Optional[torch.Tensor] = None,
-        domain_idx: int = 0,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1827,14 +1811,6 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
-
-        # Multiplicative time-decay gating: gate = exp(-decay_rate * hours)
-        # Older behaviours (larger time_diff) are attenuated.
-        if self.use_time_decay_attn and time_diff is not None:
-            decay_rate = F.softplus(self.time_decay_rates[domain_idx])  # (1,) >= 0
-            hours = time_diff * self.time_decay_scale.abs()  # convert seconds -> hours
-            gate = torch.exp(-decay_rate * hours).unsqueeze(-1)  # (B, L, 1)
-            token_emb = token_emb * gate
 
         return token_emb
 
@@ -1917,14 +1893,12 @@ class PCVRHyFormer(nn.Module):
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
-        for di, domain in enumerate(self.seq_domains):
+        for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain],
-                time_diff=inputs.seq_time_diffs.get(domain) if self.use_time_decay_attn else None,
-                domain_idx=di)
+                inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1962,14 +1936,12 @@ class PCVRHyFormer(nn.Module):
 
         seq_tokens_list = []
         seq_masks_list = []
-        for di, domain in enumerate(self.seq_domains):
+        for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain],
-                time_diff=inputs.seq_time_diffs.get(domain) if self.use_time_decay_attn else None,
-                domain_idx=di)
+                inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

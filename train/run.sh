@@ -20,15 +20,6 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
     --prefetch_factor 4 \
     "$@"
 
-# ---- Time feature ablation switches (append to the command above via "$@") ----
-#   --use_hour_encoding        # Beijing-time hour-of-day sin/cos → user_dense
-#   --use_user_time_stats      # Per-sequence recency/time_span/frequency → user_dense
-#   --use_fine_time_buckets    # 88 finer-grained time-delta buckets (vs baseline 64)
-#   --use_time_decay_attn      # Learnable multiplicative time-decay gating on seq tokens
-#
-# Example: combine all four:
-#   bash run.sh --use_hour_encoding --use_user_time_stats \
-#               --use_fine_time_buckets --use_time_decay_attn
 
 # ---- Time-range filter mode (--interval) ----
 # After the train/valid split, further filter both sets to a [start, end) timestamp window.

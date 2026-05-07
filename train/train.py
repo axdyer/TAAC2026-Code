@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS, NUM_FINE_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -194,17 +194,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
 
-    # Time feature ablation switches (all default off).
-    parser.add_argument('--use_hour_encoding', action='store_true', default=False,
-                        help='Add Beijing-time hour-of-day sin/cos to user_dense')
-    parser.add_argument('--use_user_time_stats', action='store_true', default=False,
-                        help='Add per-sequence recency/time_span/frequency to user_dense')
-    parser.add_argument('--use_fine_time_buckets', action='store_true', default=False,
-                        help='Use finer-grained time-delta bucket boundaries '
-                             '(88 boundaries vs baseline 64)')
-    parser.add_argument('--use_time_decay_attn', action='store_true', default=False,
-                        help='Apply learnable multiplicative time-decay gating '
-                             'to sequence token embeddings')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -390,10 +379,6 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        use_hour_encoding=args.use_hour_encoding,
-        use_user_time_stats=args.use_user_time_stats,
-        use_fine_time_buckets=args.use_fine_time_buckets,
-        use_time_decay_attn=args.use_time_decay_attn,
         time_range=args.time_range,
         interval=args.interval,
     )
@@ -441,11 +426,7 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
-        "num_time_buckets": (
-            NUM_FINE_TIME_BUCKETS if (args.use_time_buckets and args.use_fine_time_buckets)
-            else NUM_TIME_BUCKETS if args.use_time_buckets
-            else 0
-        ),
+        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -455,7 +436,6 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "user_feat_pair": args.user_feat_pair,
-        "use_time_decay_attn": args.use_time_decay_attn,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
