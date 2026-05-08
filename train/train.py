@@ -305,10 +305,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--user_feat_pair', type=str, default='',
                         help='Comma-separated or JSON list of user fids whose '
                              'aligned user_int/user_dense values should be paired '
-                             'and fused into the user_dense token. Supported fids: '
+                             'and converted to dense-derived user tokens. Supported fids: '
                              'positive branch 62-66, signed branch 89-91, e.g. '
                              "'62,63,64,65,66' or '[62,63,64,65,66,89,90,91]'. "
                              'Empty disables it.')
+    parser.add_argument('--user_dense_87_tokens', type=int, default=0,
+                        help='Number of NS tokens generated from user_dense fid 87 '
+                             '(10x32 multi-interest blocks) by masked attention pooling. '
+                             '0 disables the fid87 branch.')
 
     args = parser.parse_args()
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
@@ -486,6 +490,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "user_feat_pair": args.user_feat_pair,
+        "user_dense_87_tokens": args.user_dense_87_tokens,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

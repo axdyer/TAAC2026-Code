@@ -73,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
     'user_feat_pair': [],
+    'user_dense_87_tokens': 2,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

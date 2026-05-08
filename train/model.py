@@ -24,6 +24,9 @@ SUPPORTED_SIGNED_USER_PAIR_FIDS = {89, 90, 91}
 SUPPORTED_USER_PAIR_FIDS = (
     SUPPORTED_POS_USER_PAIR_FIDS | SUPPORTED_SIGNED_USER_PAIR_FIDS
 )
+USER_DENSE_EMB_FID = 61
+USER_DENSE_INTEREST_FID = 87
+USER_DENSE_INTEREST_BLOCK_DIM = 32
 
 SAMPLE_TIME_DENSE_DIM = 6
 SAMPLE_TIME_RECENCY_BOUNDARIES = (
@@ -1259,10 +1262,12 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        # User int/dense element-wise pair features. Positive long-tail fids
-        # 62-66 and signed fids 89-91 are modeled by separate branches and
-        # fused into user_dense_tok.
+        # User dense-derived tokens. fid 61 is a single user embedding token;
+        # fid 87 is treated as 10x32 multi-interest embeddings and pooled into
+        # a configurable number of tokens; 62-66 / 89-91 pair features are
+        # modeled as separate positive/signed tokens.
         user_feat_pair: Optional[List[int]] = None,
+        user_dense_87_tokens: int = 2,
         user_int_feature_ids: Optional[List[int]] = None,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
     ) -> None:
@@ -1293,6 +1298,9 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.user_feat_pair = list(user_feat_pair or [])
+        self.user_dense_87_tokens = int(user_dense_87_tokens)
+        if self.user_dense_87_tokens < 0:
+            raise ValueError(f"user_dense_87_tokens must be >= 0, got {user_dense_87_tokens}")
         if len(set(self.user_feat_pair)) != len(self.user_feat_pair):
             raise ValueError(f"user_feat_pair contains duplicate fids: {self.user_feat_pair}")
         self.has_user_feat_pair = len(self.user_feat_pair) > 0
@@ -1357,15 +1365,56 @@ class PCVRHyFormer(nn.Module):
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
-        # User dense feature projection (if available)
+        # User dense-derived tokens (if available)
         self.has_user_dense = user_dense_dim > 0
+        self.num_user_dense_tokens = 0
+        self.user_dense_61_spec: Optional[Tuple[int, int]] = None
+        self.user_dense_87_spec: Optional[Tuple[int, int]] = None
+        self.user_dense_87_blocks = 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
+            if user_dense_feature_specs is None:
+                raise ValueError("user_dense_feature_specs must be provided when user_dense_dim > 0")
+            dense_by_fid = {
+                int(fid): (int(offset), int(length))
+                for fid, offset, length in user_dense_feature_specs
+            }
+            if USER_DENSE_EMB_FID not in dense_by_fid:
+                raise ValueError(f"user dense fid {USER_DENSE_EMB_FID} not found in user_dense schema")
+            if USER_DENSE_INTEREST_FID not in dense_by_fid:
+                raise ValueError(f"user dense fid {USER_DENSE_INTEREST_FID} not found in user_dense schema")
+
+            dense61_offset, dense61_len = dense_by_fid[USER_DENSE_EMB_FID]
+            if dense61_len != 256:
+                raise ValueError(
+                    f"user dense fid {USER_DENSE_EMB_FID} expected length 256, got {dense61_len}"
+                )
+            self.user_dense_61_spec = (dense61_offset, dense61_len)
+            self.user_dense_61_proj = nn.Sequential(
+                nn.Linear(dense61_len, d_model),
                 nn.LayerNorm(d_model),
             )
+            self.num_user_dense_tokens += 1
 
-        # ================== User Int/Dense Pair Fusion ==================
+            dense87_offset, dense87_len = dense_by_fid[USER_DENSE_INTEREST_FID]
+            if dense87_len % USER_DENSE_INTEREST_BLOCK_DIM != 0:
+                raise ValueError(
+                    f"user dense fid {USER_DENSE_INTEREST_FID} length {dense87_len} "
+                    f"must be divisible by {USER_DENSE_INTEREST_BLOCK_DIM}"
+                )
+            self.user_dense_87_spec = (dense87_offset, dense87_len)
+            self.user_dense_87_blocks = dense87_len // USER_DENSE_INTEREST_BLOCK_DIM
+            if self.user_dense_87_tokens > 0:
+                self.user_dense_87_block_proj = nn.Sequential(
+                    nn.Linear(USER_DENSE_INTEREST_BLOCK_DIM, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                self.user_dense_87_queries = nn.Parameter(
+                    torch.empty(self.user_dense_87_tokens, d_model)
+                )
+                self.user_dense_87_out_norm = nn.LayerNorm(d_model)
+                self.num_user_dense_tokens += self.user_dense_87_tokens
+
+        # ================== User Int/Dense Pair Tokens ==================
         self.user_pos_pair_specs: List[Tuple[int, int, int, int, int]] = []
         self.user_signed_pair_specs: List[Tuple[int, int, int, int, int]] = []
         if self.has_user_feat_pair:
@@ -1389,14 +1438,8 @@ class PCVRHyFormer(nn.Module):
                     "user_int_feature_ids length must match user_int_feature_specs "
                     f"length, got {len(user_int_feature_ids)} vs {len(user_int_feature_specs)}"
                 )
-            if user_dense_feature_specs is None:
-                raise ValueError("user_dense_feature_specs must be provided when user_feat_pair is non-empty")
 
             int_idx_by_fid = {int(fid): i for i, fid in enumerate(user_int_feature_ids)}
-            dense_by_fid = {
-                int(fid): (int(offset), int(length))
-                for fid, offset, length in user_dense_feature_specs
-            }
 
             def _build_pair_branch(
                 fids: List[int],
@@ -1445,7 +1488,7 @@ class PCVRHyFormer(nn.Module):
                     nn.Linear(len(self.user_pos_pair_specs) * emb_dim, d_model),
                     nn.LayerNorm(d_model),
                 )
-                self.user_pos_pair_gate = nn.Parameter(torch.tensor(0.1))
+                self.num_user_dense_tokens += 1
 
             if self.has_user_signed_pair:
                 self.user_signed_pair_specs, signed_pair_embs, signed_pair_norms = (
@@ -1457,13 +1500,21 @@ class PCVRHyFormer(nn.Module):
                     nn.Linear(len(self.user_signed_pair_specs) * emb_dim, d_model),
                     nn.LayerNorm(d_model),
                 )
-                self.user_signed_pair_gate = nn.Parameter(torch.tensor(0.1))
+                self.num_user_dense_tokens += 1
 
-            self.user_dense_pair_norm = nn.LayerNorm(d_model)
             logging.info(
-                f"User int/dense pair fusion enabled for fids={self.user_feat_pair}; "
+                f"User int/dense pair tokens enabled for fids={self.user_feat_pair}; "
                 f"positive_branch={self.user_pos_feat_pair}, "
                 f"signed_branch={self.user_signed_feat_pair}"
+            )
+
+        if self.has_user_dense:
+            logging.info(
+                f"User dense split enabled: fid61_tokens=1, "
+                f"fid87_tokens={self.user_dense_87_tokens}, "
+                f"pos_pair_tokens={1 if self.has_user_pos_pair else 0}, "
+                f"signed_pair_tokens={1 if self.has_user_signed_pair else 0}, "
+                f"total_user_dense_tokens={self.num_user_dense_tokens}"
             )
 
         # Item dense feature projection (if available)
@@ -1491,7 +1542,7 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_ns = (num_user_ns + self.num_user_dense_tokens
                        + (1 if self.use_sample_time_token else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
@@ -1658,6 +1709,9 @@ class PCVRHyFormer(nn.Module):
             for emb in self.user_signed_pair_embs:
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
+
+        if self.has_user_dense and self.user_dense_87_tokens > 0:
+            nn.init.xavier_normal_(self.user_dense_87_queries.data)
 
         if self.num_time_buckets > 0:
             if self.domain_time_buckets:
@@ -1831,24 +1885,62 @@ class PCVRHyFormer(nn.Module):
             signed=True,
         )
 
-    def _make_user_dense_token(
+    def _make_user_dense_61_token(
+        self,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project fid 61, a single 256D user embedding, into one NS token."""
+        if self.user_dense_61_spec is None:
+            raise RuntimeError("user_dense_61_spec is not initialized")
+        offset, length = self.user_dense_61_spec
+        x61 = user_dense_feats[:, offset:offset + length].float()
+        return F.silu(self.user_dense_61_proj(x61)).unsqueeze(1)
+
+    def _make_user_dense_87_tokens(
+        self,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool fid 87 10x32 multi-interest embeddings into N NS tokens."""
+        if self.user_dense_87_spec is None:
+            raise RuntimeError("user_dense_87_spec is not initialized")
+        offset, length = self.user_dense_87_spec
+        B = user_dense_feats.shape[0]
+        x87 = user_dense_feats[:, offset:offset + length].float()
+        x87 = x87.view(B, self.user_dense_87_blocks, USER_DENSE_INTEREST_BLOCK_DIM)
+        mask = x87.norm(dim=-1) > 1e-6  # (B, K), all-zero blocks are padding
+
+        block_tokens = F.silu(self.user_dense_87_block_proj(x87))  # (B, K, D)
+        block_tokens = block_tokens * mask.unsqueeze(-1).to(block_tokens.dtype)
+
+        scores = torch.einsum(
+            'td,bkd->btk', self.user_dense_87_queries, block_tokens
+        ) / math.sqrt(self.d_model)
+        scores = scores.masked_fill(~mask.unsqueeze(1), -1e4)
+        attn = torch.softmax(scores, dim=-1)
+        attn = attn * mask.unsqueeze(1).to(attn.dtype)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        tokens = torch.matmul(attn, block_tokens)  # (B, N87, D)
+        return F.silu(self.user_dense_87_out_norm(tokens))
+
+    def _make_user_dense_tokens(
         self,
         user_int_feats: torch.Tensor,
         user_dense_feats: torch.Tensor,
     ) -> torch.Tensor:
-        user_dense_base = self.user_dense_proj(user_dense_feats)
-        if self.has_user_feat_pair:
-            fused = user_dense_base
-            if self.has_user_pos_pair:
-                pos_pair_token = self._embed_user_pos_feat_pairs(
-                    user_int_feats, user_dense_feats)
-                fused = fused + self.user_pos_pair_gate * pos_pair_token
-            if self.has_user_signed_pair:
-                signed_pair_token = self._embed_user_signed_feat_pairs(
-                    user_int_feats, user_dense_feats)
-                fused = fused + self.user_signed_pair_gate * signed_pair_token
-            user_dense_base = self.user_dense_pair_norm(fused)
-        return F.silu(user_dense_base).unsqueeze(1)
+        """Build all dense-derived user NS tokens."""
+        dense_parts = [self._make_user_dense_61_token(user_dense_feats)]
+        if self.user_dense_87_tokens > 0:
+            dense_parts.append(self._make_user_dense_87_tokens(user_dense_feats))
+        if self.has_user_pos_pair:
+            pos_pair_token = self._embed_user_pos_feat_pairs(
+                user_int_feats, user_dense_feats)
+            dense_parts.append(F.silu(pos_pair_token).unsqueeze(1))
+        if self.has_user_signed_pair:
+            signed_pair_token = self._embed_user_signed_feat_pairs(
+                user_int_feats, user_dense_feats)
+            dense_parts.append(F.silu(signed_pair_token).unsqueeze(1))
+        return torch.cat(dense_parts, dim=1)
 
     def _make_sample_time_token(self, timestamps: torch.Tensor) -> torch.Tensor:
         """Build one NS token from the sample request/exposure timestamp.
@@ -1989,9 +2081,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = self._make_user_dense_token(
-                inputs.user_int_feats, inputs.user_dense_feats)  # (B, 1, D)
-            ns_parts.append(user_dense_tok)
+            user_dense_tokens = self._make_user_dense_tokens(
+                inputs.user_int_feats, inputs.user_dense_feats)  # (B, Ndense, D)
+            ns_parts.append(user_dense_tokens)
         if self.use_sample_time_token:
             ns_parts.append(self._make_sample_time_token(inputs.timestamp))
         ns_parts.append(item_ns)
@@ -2036,9 +2128,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = self._make_user_dense_token(
+            user_dense_tokens = self._make_user_dense_tokens(
                 inputs.user_int_feats, inputs.user_dense_feats)
-            ns_parts.append(user_dense_tok)
+            ns_parts.append(user_dense_tokens)
         if self.use_sample_time_token:
             ns_parts.append(self._make_sample_time_token(inputs.timestamp))
         ns_parts.append(item_ns)
