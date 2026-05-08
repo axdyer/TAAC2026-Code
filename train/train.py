@@ -214,24 +214,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
-    parser.add_argument('--use_time_sample_weight', action='store_true', default=False,
-                        help='Enable fixed per-sample loss weights based on timestamp '
-                             'recency. Disabled by default.')
-    parser.add_argument('--time_weight_ref_timestamp', type=int, default=0,
-                        help='Reference/cutoff Unix timestamp for recency weighting. '
-                             'Required when --use_time_sample_weight is set. Samples '
-                             'closer to this timestamp receive larger loss weights.')
-    parser.add_argument('--time_weight_half_life_hours', type=float, default=3.0,
-                        help='Half-life in hours for exponential time-sample weighting. '
-                             'Every half-life farther from --time_weight_ref_timestamp '
-                             'halves the distance from max weight to min weight.')
-    parser.add_argument('--time_weight_min', type=float, default=0.05,
-                        help='Minimum fixed loss weight for old samples when '
-                             '--use_time_sample_weight is set.')
-    parser.add_argument('--time_weight_max', type=float, default=3.0,
-                        help='Maximum fixed loss weight for samples at '
-                             '--time_weight_ref_timestamp when --use_time_sample_weight '
-                             'is set.')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -315,18 +297,6 @@ def main() -> None:
             raise ValueError(
                 f"--time_range start must be < end, got "
                 f"{args.time_range[0]} >= {args.time_range[1]}")
-    if args.use_time_sample_weight:
-        if args.time_weight_ref_timestamp <= 0:
-            raise ValueError(
-                "--time_weight_ref_timestamp must be explicitly set to a positive "
-                "Unix timestamp when --use_time_sample_weight is enabled"
-            )
-        if args.time_weight_half_life_hours <= 0:
-            raise ValueError("--time_weight_half_life_hours must be > 0")
-        if args.time_weight_min <= 0:
-            raise ValueError("--time_weight_min must be > 0")
-        if args.time_weight_max < args.time_weight_min:
-            raise ValueError("--time_weight_max must be >= --time_weight_min")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -475,11 +445,6 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
-        use_time_sample_weight=args.use_time_sample_weight,
-        time_weight_ref_timestamp=args.time_weight_ref_timestamp,
-        time_weight_half_life_hours=args.time_weight_half_life_hours,
-        time_weight_min=args.time_weight_min,
-        time_weight_max=args.time_weight_max,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
