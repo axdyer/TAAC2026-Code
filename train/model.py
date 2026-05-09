@@ -13,6 +13,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    timestamp: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
@@ -22,6 +23,24 @@ SUPPORTED_POS_USER_PAIR_FIDS = {62, 63, 64, 65, 66}
 SUPPORTED_SIGNED_USER_PAIR_FIDS = {89, 90, 91}
 SUPPORTED_USER_PAIR_FIDS = (
     SUPPORTED_POS_USER_PAIR_FIDS | SUPPORTED_SIGNED_USER_PAIR_FIDS
+)
+
+SAMPLE_TIME_DENSE_DIM = 6
+SAMPLE_TIME_RECENCY_BOUNDARIES = (
+    600,       # 10 minutes
+    1800,      # 30 minutes
+    3600,      # 1 hour
+    7200,      # 2 hours
+    14400,     # 4 hours
+    28800,     # 8 hours
+    43200,     # 12 hours
+    64800,     # 18 hours
+    86400,     # 1 day
+    129600,    # 1.5 days
+    172800,    # 2 days
+    259200,    # 3 days
+    345600,    # 4 days
+    432000,    # 5 days
 )
 
 
@@ -1227,6 +1246,10 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
+        domain_time_buckets: bool = False,
+        use_sample_time_token: bool = False,
+        sample_time_ref_ts: int = 0,
+        sample_time_timezone_offset_hours: int = 8,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1252,6 +1275,18 @@ class PCVRHyFormer(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.domain_time_buckets = domain_time_buckets
+        self.use_sample_time_token = use_sample_time_token
+        self.sample_time_ref_ts = int(sample_time_ref_ts)
+        self.sample_time_timezone_offset_seconds = (
+            int(sample_time_timezone_offset_hours) * 3600
+        )
+        if self.domain_time_buckets and self.num_time_buckets <= 0:
+            raise ValueError("domain_time_buckets=True requires num_time_buckets > 0")
+        if self.use_sample_time_token and self.sample_time_ref_ts <= 0:
+            raise ValueError(
+                "use_sample_time_token=True requires sample_time_ref_ts to be "
+                "a positive Unix timestamp")
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1439,8 +1474,25 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # Sample-level timestamp token. This is separate from sequence
+        # recency buckets: it models the request/exposure time itself.
+        if self.use_sample_time_token:
+            self.sample_time_dense_proj = nn.Sequential(
+                nn.Linear(SAMPLE_TIME_DENSE_DIM, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.sample_time_recency_embedding = nn.Embedding(
+                len(SAMPLE_TIME_RECENCY_BOUNDARIES) + 1, d_model
+            )
+            self.sample_time_norm = nn.LayerNorm(d_model)
+            self.register_buffer(
+                'sample_time_recency_boundaries',
+                torch.tensor(SAMPLE_TIME_RECENCY_BOUNDARIES, dtype=torch.long),
+            )
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+                       + (1 if self.use_sample_time_token else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
@@ -1503,7 +1555,13 @@ class PCVRHyFormer(nn.Module):
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+            if self.domain_time_buckets:
+                self.time_embeddings = nn.ModuleDict({
+                    domain: nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+                    for domain in self.seq_domains
+                })
+            else:
+                self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1602,8 +1660,16 @@ class PCVRHyFormer(nn.Module):
                 emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
-            nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+            if self.domain_time_buckets:
+                for emb in self.time_embeddings.values():
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+            else:
+                nn.init.xavier_normal_(self.time_embedding.weight.data)
+                self.time_embedding.weight.data[0, :] = 0
+
+        if self.use_sample_time_token:
+            nn.init.xavier_normal_(self.sample_time_recency_embedding.weight.data)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1678,8 +1744,10 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
+        # time embeddings are always preserved
         if self.num_time_buckets > 0:
+            skip_count += len(self.seq_domains) if self.domain_time_buckets else 1
+        if self.use_sample_time_token:
             skip_count += 1
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
@@ -1782,8 +1850,46 @@ class PCVRHyFormer(nn.Module):
             user_dense_base = self.user_dense_pair_norm(fused)
         return F.silu(user_dense_base).unsqueeze(1)
 
+    def _make_sample_time_token(self, timestamps: torch.Tensor) -> torch.Tensor:
+        """Build one NS token from the sample request/exposure timestamp.
+
+        The recency bucket uses ``max(sample_time_ref_ts - timestamp, 0)`` so
+        test rows after the training cutoff land in the newest bucket instead
+        of an unseen negative-age region.
+        """
+        ts_long = timestamps.long()
+        local_ts = ts_long + self.sample_time_timezone_offset_seconds
+        seconds_in_day = torch.remainder(local_ts, 86400).float()
+        hour_idx = torch.div(seconds_in_day, 3600, rounding_mode='floor')
+        day_idx = torch.div(local_ts, 86400, rounding_mode='floor')
+        day_of_week = torch.remainder(day_idx, 7).float()
+
+        minute_phase = seconds_in_day / 86400.0
+        hour_phase = hour_idx / 24.0
+        week_phase = day_of_week / 7.0
+        two_pi = 2.0 * math.pi
+        dense_feats = torch.stack([
+            torch.sin(two_pi * minute_phase),
+            torch.cos(two_pi * minute_phase),
+            torch.sin(two_pi * hour_phase),
+            torch.cos(two_pi * hour_phase),
+            torch.sin(two_pi * week_phase),
+            torch.cos(two_pi * week_phase),
+        ], dim=-1)
+
+        age_seconds = torch.clamp(self.sample_time_ref_ts - ts_long, min=0)
+        recency_bucket = torch.bucketize(
+            age_seconds,
+            self.sample_time_recency_boundaries.to(age_seconds.device),
+        )
+        time_dense = self.sample_time_dense_proj(dense_feats)
+        time_recency = self.sample_time_recency_embedding(recency_bucket)
+        time_token = self.sample_time_norm(time_dense + time_recency)
+        return F.silu(time_token).unsqueeze(1)
+
     def _embed_seq_domain(
         self,
+        domain: str,
         seq: torch.Tensor,
         sideinfo_embs: nn.ModuleList,
         proj: nn.Module,
@@ -1810,7 +1916,10 @@ class PCVRHyFormer(nn.Module):
 
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+            if self.domain_time_buckets:
+                token_emb = token_emb + self.time_embeddings[domain](time_bucket_ids)
+            else:
+                token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
         return token_emb
 
@@ -1883,6 +1992,8 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = self._make_user_dense_token(
                 inputs.user_int_feats, inputs.user_dense_feats)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
+        if self.use_sample_time_token:
+            ns_parts.append(self._make_sample_time_token(inputs.timestamp))
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
@@ -1895,6 +2006,7 @@ class PCVRHyFormer(nn.Module):
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
@@ -1927,6 +2039,8 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = self._make_user_dense_token(
                 inputs.user_int_feats, inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
+        if self.use_sample_time_token:
+            ns_parts.append(self._make_sample_time_token(inputs.timestamp))
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
@@ -1938,6 +2052,7 @@ class PCVRHyFormer(nn.Module):
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],

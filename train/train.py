@@ -14,7 +14,8 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import List, Tuple, Union
 
 import torch
 
@@ -68,6 +69,24 @@ def parse_user_feat_pair(value: str) -> List[int]:
         seen.add(fid)
         result.append(fid)
     return result
+
+
+def _parse_positive_int_or_auto(value: str, arg_name: str) -> Union[int, str]:
+    s = str(value).strip()
+    if s == 'auto':
+        return s
+    if not s.isdigit():
+        raise ValueError(f"{arg_name} must be a positive Unix timestamp or 'auto', got {value!r}")
+    parsed = int(s)
+    if parsed <= 0:
+        raise ValueError(f"{arg_name} must be positive or 'auto', got {parsed}")
+    return parsed
+
+
+def _format_bj_time(timestamp: int) -> str:
+    tz = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone(tz).strftime(
+        '%Y-%m-%d %H:%M:%S')
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,6 +212,25 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--domain_time_buckets', action='store_true', default=False,
+                        help='Use one separate sequence time-bucket Embedding per '
+                             'sequence domain instead of sharing one Embedding '
+                             'across seq_a/seq_b/seq_c/seq_d. Requires time '
+                             'buckets to be enabled.')
+    parser.add_argument('--use_sample_time_token', action='store_true', default=False,
+                        help='Append one sample-level timestamp token to the NS '
+                             'token set. This changes T and may require adjusting '
+                             '--d_model so d_model %% T == 0.')
+    parser.add_argument('--sample_time_ref_ts', type=str, default='0',
+                        help='Reference Unix timestamp used by --use_sample_time_token '
+                             'for recency bucketing. Set this explicitly to the '
+                             'training cutoff / test-start timestamp, e.g. '
+                             "1774222835, or use 'auto' to scan the actual "
+                             'training split max timestamp. Required when '
+                             '--use_sample_time_token is set.')
+    parser.add_argument('--sample_time_timezone_offset_hours', type=int, default=8,
+                        help='Timezone offset used to derive local hour/day cyclical '
+                             'features from timestamp. Beijing time = 8.')
 
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
@@ -274,6 +312,22 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
+    if args.use_sample_time_token:
+        args.sample_time_ref_ts = _parse_positive_int_or_auto(
+            args.sample_time_ref_ts,
+            '--sample_time_ref_ts',
+        )
+    elif str(args.sample_time_ref_ts).strip() != '0':
+        if str(args.sample_time_ref_ts).strip() == 'auto':
+            raise ValueError(
+                "--sample_time_ref_ts auto is only valid together with "
+                "--use_sample_time_token")
+        args.sample_time_ref_ts = _parse_positive_int_or_auto(
+            args.sample_time_ref_ts,
+            '--sample_time_ref_ts',
+        )
+    else:
+        args.sample_time_ref_ts = 0
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -297,6 +351,12 @@ def main() -> None:
             raise ValueError(
                 f"--time_range start must be < end, got "
                 f"{args.time_range[0]} >= {args.time_range[1]}")
+    if args.domain_time_buckets and not args.use_time_buckets:
+        raise ValueError("--domain_time_buckets requires --use_time_buckets")
+    if args.use_sample_time_token and args.sample_time_ref_ts == 0:
+        raise ValueError(
+            "--use_sample_time_token requires --sample_time_ref_ts to be set "
+            "to a positive Unix timestamp or 'auto'")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -353,6 +413,22 @@ def main() -> None:
         interval=args.interval,
     )
 
+    if args.use_sample_time_token and args.sample_time_ref_ts == 'auto':
+        resolved_ref_ts = pcvr_dataset.max_timestamp()
+        args.sample_time_ref_ts = resolved_ref_ts
+        logging.info(
+            "Resolved --sample_time_ref_ts auto to %s (%s Beijing time) "
+            "from the actual training split.",
+            resolved_ref_ts,
+            _format_bj_time(resolved_ref_ts),
+        )
+    elif args.use_sample_time_token:
+        logging.info(
+            "Using --sample_time_ref_ts=%s (%s Beijing time).",
+            args.sample_time_ref_ts,
+            _format_bj_time(int(args.sample_time_ref_ts)),
+        )
+
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
@@ -397,6 +473,10 @@ def main() -> None:
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "domain_time_buckets": args.domain_time_buckets,
+        "use_sample_time_token": args.use_sample_time_token,
+        "sample_time_ref_ts": args.sample_time_ref_ts,
+        "sample_time_timezone_offset_hours": args.sample_time_timezone_offset_hours,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,

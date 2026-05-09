@@ -367,6 +367,48 @@ class PCVRParquetDataset(IterableDataset):
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
 
+    def max_timestamp(self, scan_batch_size: int = 65536) -> int:
+        """Return the maximum ``timestamp`` in this dataset after filters.
+
+        This scans only the timestamp column over the dataset's Row Group slice
+        and applies the same row-level timestamp_min/timestamp_max filters used
+        during iteration. It is intended for resolving sample-level time feature
+        reference points from the actual training split.
+        """
+        if 'timestamp' not in self._col_idx:
+            raise KeyError(
+                "Cannot resolve max timestamp because the parquet schema does "
+                "not contain a 'timestamp' column")
+
+        max_ts: Optional[int] = None
+        for file_path, rg_idx, _ in self._rg_list:
+            pf = pq.ParquetFile(file_path)
+            for batch in pf.iter_batches(
+                batch_size=scan_batch_size,
+                row_groups=[rg_idx],
+                columns=['timestamp'],
+            ):
+                col = batch.column(0)
+                if col.null_count:
+                    raise ValueError(
+                        f"timestamp contains null values in {file_path}, "
+                        f"row_group={rg_idx}")
+                arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
+                if self.timestamp_min is not None:
+                    arr = arr[arr >= self.timestamp_min]
+                if self.timestamp_max is not None:
+                    arr = arr[arr < self.timestamp_max]
+                if arr.size == 0:
+                    continue
+                batch_max = int(arr.max())
+                max_ts = batch_max if max_ts is None else max(max_ts, batch_max)
+
+        if max_ts is None:
+            raise ValueError(
+                "No rows found while resolving max timestamp. Check data_dir, "
+                "split settings, and timestamp filters.")
+        return max_ts
+
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
         rg_list = self._rg_list
