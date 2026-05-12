@@ -149,10 +149,11 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--split_mode', type=str, default='rowgroup',
-                        choices=['timestamp', 'rowgroup'],
+                        choices=['timestamp', 'rowgroup', 'manual_time'],
                         help='Train/valid split mode. timestamp = row-level time '
                              'split by timestamp, using the latest valid_ratio rows '
-                             'as validation; rowgroup = baseline tail Row Group split.')
+                             'as validation; rowgroup = baseline tail Row Group split; '
+                             'manual_time = use --train_val_range closed time ranges.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
                         help='Fraction of training Row Groups to use in rowgroup split '
                              '(timestamp split requires this to stay at 1.0)')
@@ -160,13 +161,19 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of data used for validation. timestamp split uses '
                              'the latest rows by timestamp; rowgroup split uses tail Row Groups.')
     parser.add_argument('--interval', action='store_true', default=False,
-                        help='After the train/valid split, further filter both sets '
-                             'to only keep rows whose timestamp falls in --time_range. '
+                        help='First keep rows whose timestamp falls in --time_range, '
+                             'then apply --split_mode on that sub-dataset. '
                              'Requires --time_range START END.')
     parser.add_argument('--time_range', type=int, nargs=2, default=None,
                         metavar=('START', 'END'),
                         help='Time range filter (Unix timestamps), used when --interval '
                              'is set. Rows with START <= timestamp < END are kept.')
+    parser.add_argument('--train_val_range', type=int, nargs=4, default=None,
+                        metavar=('TRAIN_MIN', 'TRAIN_MAX', 'VALID_MIN', 'VALID_MAX'),
+                        help='Manual train/valid time ranges for '
+                             '--split_mode manual_time. All ranges are closed: '
+                             'TRAIN_MIN <= timestamp <= TRAIN_MAX and '
+                             'VALID_MIN <= timestamp <= VALID_MAX.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -355,6 +362,35 @@ def main() -> None:
             raise ValueError(
                 f"--time_range start must be < end, got "
                 f"{args.time_range[0]} >= {args.time_range[1]}")
+    if args.split_mode == 'manual_time':
+        if args.interval:
+            raise ValueError(
+                "--split_mode manual_time cannot be combined with --interval; "
+                "use --train_val_range to define both partitions")
+        if args.train_val_range is None or len(args.train_val_range) != 4:
+            raise ValueError(
+                "--split_mode manual_time requires --train_val_range "
+                "TRAIN_MIN TRAIN_MAX VALID_MIN VALID_MAX")
+        train_time_min, train_time_max, valid_time_min, valid_time_max = args.train_val_range
+        if train_time_min <= 0 or train_time_max <= 0 or valid_time_min <= 0 or valid_time_max <= 0:
+            raise ValueError(
+                "--train_val_range values must be positive Unix timestamps, "
+                f"got {args.train_val_range}")
+        if train_time_min > train_time_max:
+            raise ValueError(
+                f"manual train range must satisfy TRAIN_MIN <= TRAIN_MAX, got "
+                f"{train_time_min} > {train_time_max}")
+        if valid_time_min > valid_time_max:
+            raise ValueError(
+                f"manual valid range must satisfy VALID_MIN <= VALID_MAX, got "
+                f"{valid_time_min} > {valid_time_max}")
+        if not (train_time_max < valid_time_min or valid_time_max < train_time_min):
+            raise ValueError(
+                "manual train/valid time ranges overlap; refusing to create a "
+                f"leaky validation split: train=[{train_time_min}, {train_time_max}], "
+                f"valid=[{valid_time_min}, {valid_time_max}]")
+    elif args.train_val_range is not None:
+        raise ValueError("--train_val_range is only valid with --split_mode manual_time")
     if args.domain_time_buckets and not args.use_time_buckets:
         raise ValueError("--domain_time_buckets requires --use_time_buckets")
     if args.use_sample_time_token and args.sample_time_ref_ts == 0:
@@ -415,6 +451,7 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         time_range=args.time_range,
         interval=args.interval,
+        train_val_range=args.train_val_range,
     )
 
     if args.use_sample_time_token and args.sample_time_ref_ts == 'auto':

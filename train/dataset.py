@@ -152,6 +152,7 @@ class PCVRParquetDataset(IterableDataset):
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
+        row_groups: Optional[List[Tuple[str, int, int]]] = None,
         timestamp_min: Optional[int] = None,
         timestamp_max: Optional[int] = None,
         known_num_rows: Optional[int] = None,
@@ -171,6 +172,8 @@ class PCVRParquetDataset(IterableDataset):
             buffer_batches: shuffle buffer size in units of batches.
             row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
                 use all Row Groups.
+            row_groups: explicit Row Group list. Used when a prior row-level
+                time filter has defined a sub-dataset before Row Group splitting.
             timestamp_min: optional inclusive lower bound for row-level
                 ``timestamp`` filtering.
             timestamp_max: optional exclusive upper bound for row-level
@@ -215,15 +218,20 @@ class PCVRParquetDataset(IterableDataset):
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
 
         # Build the list of Row Groups.
-        self._rg_list = []
-        for f in self._parquet_files:
-            pf = pq.ParquetFile(f)
-            for i in range(pf.metadata.num_row_groups):
-                self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
+        if row_groups is not None:
+            if row_group_range is not None:
+                raise ValueError("row_groups and row_group_range are mutually exclusive")
+            self._rg_list = list(row_groups)
+        else:
+            self._rg_list = []
+            for f in self._parquet_files:
+                pf = pq.ParquetFile(f)
+                for i in range(pf.metadata.num_row_groups):
+                    self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
 
-        if row_group_range is not None:
-            start, end = row_group_range
-            self._rg_list = self._rg_list[start:end]
+            if row_group_range is not None:
+                start, end = row_group_range
+                self._rg_list = self._rg_list[start:end]
 
         self.num_rows = (
             int(known_num_rows)
@@ -380,6 +388,24 @@ class PCVRParquetDataset(IterableDataset):
                 "Cannot resolve max timestamp because the parquet schema does "
                 "not contain a 'timestamp' column")
 
+        stats = self.timestamp_stats(scan_batch_size=scan_batch_size)
+        return stats['timestamp_max']
+
+    def timestamp_stats(self, scan_batch_size: int = 65536) -> Dict[str, int]:
+        """Scan this dataset partition and return real timestamp statistics.
+
+        The scan follows the dataset's actual Row Group list and applies the
+        same row-level timestamp_min/timestamp_max filters used by iteration.
+        This is used to audit train/valid splits from the resulting datasets,
+        not from split parameters.
+        """
+        if 'timestamp' not in self._col_idx:
+            raise KeyError(
+                "Cannot compute timestamp stats because the parquet schema "
+                "does not contain a 'timestamp' column")
+
+        count = 0
+        min_ts: Optional[int] = None
         max_ts: Optional[int] = None
         for file_path, rg_idx, _ in self._rg_list:
             pf = pq.ParquetFile(file_path)
@@ -400,14 +426,21 @@ class PCVRParquetDataset(IterableDataset):
                     arr = arr[arr < self.timestamp_max]
                 if arr.size == 0:
                     continue
+                count += int(arr.shape[0])
+                batch_min = int(arr.min())
                 batch_max = int(arr.max())
+                min_ts = batch_min if min_ts is None else min(min_ts, batch_min)
                 max_ts = batch_max if max_ts is None else max(max_ts, batch_max)
 
         if max_ts is None:
             raise ValueError(
-                "No rows found while resolving max timestamp. Check data_dir, "
+                "No rows found while scanning timestamp stats. Check data_dir, "
                 "split settings, and timestamp filters.")
-        return max_ts
+        return {
+            'rows': count,
+            'timestamp_min': int(min_ts),
+            'timestamp_max': int(max_ts),
+        }
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
@@ -818,9 +851,12 @@ def get_pcvr_data(
         ``timestamp >= cutoff`` are validation.
       - ``rowgroup``: reproduce the baseline behavior, using the tail
         ``valid_ratio`` fraction of Row Groups as validation.
+      - ``manual_time``: use two explicit closed timestamp ranges passed via
+        ``train_val_range=(train_min, train_max, valid_min, valid_max)``.
 
-    When ``interval`` is True, both train and valid splits are further filtered
-    to only keep rows whose ``timestamp`` falls in ``[time_range_start, time_range_end)``.
+    When ``interval`` is True, rows are first filtered to
+    ``[time_range_start, time_range_end)``, and the requested split mode is then
+    applied to that sub-dataset.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -831,6 +867,7 @@ def get_pcvr_data(
     random.seed(seed)
     interval: bool = kwargs.get('interval', False)
     time_range = kwargs.get('time_range', None)
+    train_val_range = kwargs.get('train_val_range', None)
     time_range_start: Optional[int] = None
     time_range_end: Optional[int] = None
     if interval:
@@ -843,16 +880,57 @@ def get_pcvr_data(
             raise ValueError(
                 f"time_range start must be < end, got "
                 f"{time_range_start} >= {time_range_end}")
-    if not (0.0 < valid_ratio < 1.0):
-        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
-    if split_mode not in ('timestamp', 'rowgroup'):
+    if split_mode not in ('timestamp', 'rowgroup', 'manual_time'):
         raise ValueError(
-            f"split_mode must be one of 'timestamp', 'rowgroup', "
+            f"split_mode must be one of 'timestamp', 'rowgroup', 'manual_time', "
             f"got {split_mode!r}")
+    if split_mode != 'manual_time' and not (0.0 < valid_ratio < 1.0):
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    manual_train_min: Optional[int] = None
+    manual_train_max_exclusive: Optional[int] = None
+    manual_valid_min: Optional[int] = None
+    manual_valid_max_exclusive: Optional[int] = None
+    if split_mode == 'manual_time':
+        if interval:
+            raise ValueError(
+                "--split_mode manual_time cannot be combined with --interval; "
+                "use --train_val_range to define both partitions")
+        if train_val_range is None or len(train_val_range) != 4:
+            raise ValueError(
+                "--split_mode manual_time requires --train_val_range "
+                "TRAIN_MIN TRAIN_MAX VALID_MIN VALID_MAX")
+        train_min, train_max, valid_min, valid_max = [int(v) for v in train_val_range]
+        if train_min <= 0 or train_max <= 0 or valid_min <= 0 or valid_max <= 0:
+            raise ValueError(
+                "--train_val_range values must be positive Unix timestamps, "
+                f"got {train_val_range}")
+        if train_min > train_max:
+            raise ValueError(
+                f"manual train range must satisfy TRAIN_MIN <= TRAIN_MAX, got "
+                f"{train_min} > {train_max}")
+        if valid_min > valid_max:
+            raise ValueError(
+                f"manual valid range must satisfy VALID_MIN <= VALID_MAX, got "
+                f"{valid_min} > {valid_max}")
+        if not (train_max < valid_min or valid_max < train_min):
+            raise ValueError(
+                "manual train/valid time ranges overlap; refusing to create a "
+                f"leaky validation split: train=[{train_min}, {train_max}], "
+                f"valid=[{valid_min}, {valid_max}]")
+        manual_train_min = train_min
+        manual_train_max_exclusive = train_max + 1
+        manual_valid_min = valid_min
+        manual_valid_max_exclusive = valid_max + 1
+    elif train_val_range is not None:
+        raise ValueError("--train_val_range is only valid with --split_mode manual_time")
     if split_mode == 'timestamp' and train_ratio < 1.0:
         raise ValueError(
             "--train_ratio < 1.0 is only supported with --split_mode rowgroup. "
             "Timestamp mode uses all rows before the timestamp cutoff.")
+    if split_mode == 'manual_time' and train_ratio < 1.0:
+        raise ValueError(
+            "--train_ratio < 1.0 is not supported with --split_mode manual_time. "
+            "Set the train interval explicitly through --train_val_range.")
 
     import glob as _glob
     pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
@@ -864,21 +942,86 @@ def get_pcvr_data(
         pf = pq.ParquetFile(f)
         for i in range(pf.metadata.num_row_groups):
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
-    total_rgs = len(rg_info)
 
     timestamp_cutoff: Optional[int] = None
     train_row_group_range: Optional[Tuple[int, int]] = None
     valid_row_group_range: Optional[Tuple[int, int]] = None
+    train_row_groups: Optional[List[Tuple[str, int, int]]] = None
+    valid_row_groups: Optional[List[Tuple[str, int, int]]] = None
+    train_timestamp_min: Optional[int] = None
     train_timestamp_max: Optional[int] = None
     valid_timestamp_min: Optional[int] = None
+    valid_timestamp_max: Optional[int] = None
 
-    if split_mode == 'timestamp':
-        timestamp_cutoff, train_rows, valid_rows = _compute_timestamp_split(
+    interval_min = time_range_start if interval else None
+    interval_max = time_range_end if interval else None
+    if split_mode == 'manual_time':
+        train_row_groups = _filter_rg_info_by_timestamp(
             rg_info=rg_info,
-            valid_ratio=valid_ratio,
+            timestamp_min=manual_train_min,
+            timestamp_max=manual_train_max_exclusive,
         )
+        valid_row_groups = _filter_rg_info_by_timestamp(
+            rg_info=rg_info,
+            timestamp_min=manual_valid_min,
+            timestamp_max=manual_valid_max_exclusive,
+        )
+        if not train_row_groups:
+            raise ValueError(
+                f"No training rows found in manual closed time range "
+                f"[{manual_train_min}, {manual_train_max_exclusive - 1}]")
+        if not valid_row_groups:
+            raise ValueError(
+                f"No validation rows found in manual closed time range "
+                f"[{manual_valid_min}, {manual_valid_max_exclusive - 1}]")
+        split_rg_info = rg_info
+    else:
+        split_rg_info = (
+            _filter_rg_info_by_timestamp(
+                rg_info=rg_info,
+                timestamp_min=interval_min,
+                timestamp_max=interval_max,
+            )
+            if interval else rg_info
+        )
+        if not split_rg_info:
+            raise ValueError(
+                f"No rows found after applying interval filter "
+                f"[{time_range_start}, {time_range_end})")
+    total_rgs = len(split_rg_info)
+
+    if split_mode == 'manual_time':
+        train_rows = sum(r[2] for r in train_row_groups)
+        valid_rows = sum(r[2] for r in valid_row_groups)
+        train_timestamp_min = manual_train_min
+        train_timestamp_max = manual_train_max_exclusive
+        valid_timestamp_min = manual_valid_min
+        valid_timestamp_max = manual_valid_max_exclusive
+
+        logging.info(
+            "Manual time split: train uses closed range [%s, %s] "
+            "(%s rows from %s Row Groups), valid uses closed range [%s, %s] "
+            "(%s rows from %s Row Groups)",
+            manual_train_min,
+            manual_train_max_exclusive - 1,
+            train_rows,
+            len(train_row_groups),
+            manual_valid_min,
+            manual_valid_max_exclusive - 1,
+            valid_rows,
+            len(valid_row_groups),
+        )
+    elif split_mode == 'timestamp':
+        timestamp_cutoff, train_rows, valid_rows = _compute_timestamp_split(
+            rg_info=split_rg_info,
+            valid_ratio=valid_ratio,
+            timestamp_min=interval_min,
+            timestamp_max=interval_max,
+        )
+        train_timestamp_min = interval_min
         train_timestamp_max = timestamp_cutoff
         valid_timestamp_min = timestamp_cutoff
+        valid_timestamp_max = interval_max
     else:
         n_valid_rgs = max(1, int(total_rgs * valid_ratio))
         n_train_rgs = total_rgs - n_valid_rgs
@@ -889,19 +1032,22 @@ def get_pcvr_data(
             logging.info(
                 f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
-        train_row_group_range = (0, n_train_rgs)
-        valid_row_group_range = (n_train_rgs, total_rgs)
+        train_rows = sum(r[2] for r in split_rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in split_rg_info[n_train_rgs:])
+        if interval:
+            train_row_groups = split_rg_info[:n_train_rgs]
+            valid_row_groups = split_rg_info[n_train_rgs:]
+            train_timestamp_min = interval_min
+            train_timestamp_max = interval_max
+            valid_timestamp_min = interval_min
+            valid_timestamp_max = interval_max
+        else:
+            train_row_group_range = (0, n_train_rgs)
+            valid_row_group_range = (n_train_rgs, total_rgs)
 
         logging.info(
             f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
             f"{n_valid_rgs} valid ({valid_rows} rows)")
-
-    # When --interval is set, apply time-range filter on top of the split.
-    if interval:
-        train_timestamp_max = time_range_end
-        valid_timestamp_min = time_range_start
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -911,9 +1057,10 @@ def get_pcvr_data(
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
         row_group_range=train_row_group_range,
-        timestamp_min=valid_timestamp_min if interval else None,
+        row_groups=train_row_groups,
+        timestamp_min=train_timestamp_min,
         timestamp_max=train_timestamp_max,
-        known_num_rows=train_rows if split_mode in ('timestamp',) else None,
+        known_num_rows=train_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
     )
 
@@ -936,20 +1083,50 @@ def get_pcvr_data(
         shuffle=False,
         buffer_batches=0,
         row_group_range=valid_row_group_range,
+        row_groups=valid_row_groups,
         timestamp_min=valid_timestamp_min,
-        timestamp_max=train_timestamp_max if interval else None,
-        known_num_rows=valid_rows if split_mode == 'timestamp' else None,
+        timestamp_max=valid_timestamp_max,
+        known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
     )
+
+    for split_name, dataset in (
+        ('train', train_dataset),
+        ('valid', valid_dataset),
+    ):
+        stats = dataset.timestamp_stats()
+        if stats['rows'] != dataset.num_rows:
+            raise RuntimeError(
+                f"{split_name} split timestamp audit row mismatch: "
+                f"dataset.num_rows={dataset.num_rows}, scanned_rows={stats['rows']}. "
+                "This indicates the split metadata and actual timestamp filters "
+                "are inconsistent.")
+        logging.info(
+            "SPLIT_AUDIT split=%s rows=%s timestamp_min=%s timestamp_max=%s",
+            split_name,
+            stats['rows'],
+            stats['timestamp_min'],
+            stats['timestamp_max'],
+        )
+
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
         num_workers=0, pin_memory=use_cuda,
     )
 
-    if interval:
+    if split_mode == 'manual_time':
+        logging.info(
+            f"Parquet split_mode=manual_time, "
+            f"train_time_range=[{manual_train_min}, {manual_train_max_exclusive - 1}], "
+            f"valid_time_range=[{manual_valid_min}, {manual_valid_max_exclusive - 1}], "
+            f"train: {train_rows} rows, valid: {valid_rows} rows, "
+            f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
+            f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
+    elif interval:
         logging.info(
             f"Parquet split_mode={split_mode}, interval=True, "
             f"time_range=[{time_range_start}, {time_range_end}), "
+            f"sub_row_groups={total_rgs}, sub_rows={sum(r[2] for r in split_rg_info)}, "
             f"train: {train_rows} rows, valid: {valid_rows} rows, "
             f"timestamp_cutoff={timestamp_cutoff}, "
             f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
@@ -964,9 +1141,51 @@ def get_pcvr_data(
     return train_loader, valid_loader, train_dataset
 
 
+def _filter_rg_info_by_timestamp(
+    rg_info: List[Tuple[str, int, int]],
+    timestamp_min: Optional[int] = None,
+    timestamp_max: Optional[int] = None,
+    scan_batch_size: int = 65536,
+) -> List[Tuple[str, int, int]]:
+    """Return Row Groups with their row counts after a timestamp filter."""
+    if timestamp_min is None and timestamp_max is None:
+        return rg_info
+
+    filtered_rg_info: List[Tuple[str, int, int]] = []
+    for file_path, rg_idx, _ in rg_info:
+        pf = pq.ParquetFile(file_path)
+        if 'timestamp' not in pf.schema_arrow.names:
+            raise KeyError(f"{file_path} does not contain required column 'timestamp'")
+
+        count = 0
+        for batch in pf.iter_batches(
+            batch_size=scan_batch_size,
+            row_groups=[rg_idx],
+            columns=['timestamp'],
+        ):
+            col = batch.column(0)
+            if col.null_count:
+                raise ValueError(
+                    f"timestamp contains null values in {file_path}, "
+                    f"row_group={rg_idx}")
+            arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
+            if timestamp_min is not None:
+                arr = arr[arr >= timestamp_min]
+            if timestamp_max is not None:
+                arr = arr[arr < timestamp_max]
+            count += int(arr.shape[0])
+
+        if count > 0:
+            filtered_rg_info.append((file_path, rg_idx, count))
+
+    return filtered_rg_info
+
+
 def _compute_timestamp_split(
     rg_info: List[Tuple[str, int, int]],
     valid_ratio: float,
+    timestamp_min: Optional[int] = None,
+    timestamp_max: Optional[int] = None,
     scan_batch_size: int = 65536,
 ) -> Tuple[int, int, int]:
     """Compute the timestamp cutoff for a strict row-level time split."""
@@ -989,7 +1208,13 @@ def _compute_timestamp_split(
                 raise ValueError(
                     f"timestamp contains null values in {file_path}, "
                     f"row_group={rg_idx}")
-            chunks.append(col.to_numpy(zero_copy_only=False).astype(np.int64))
+            arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
+            if timestamp_min is not None:
+                arr = arr[arr >= timestamp_min]
+            if timestamp_max is not None:
+                arr = arr[arr < timestamp_max]
+            if arr.size > 0:
+                chunks.append(arr)
 
     if not chunks:
         raise ValueError("No timestamp values found while computing timestamp split")
