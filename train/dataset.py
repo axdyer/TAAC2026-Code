@@ -855,7 +855,7 @@ def get_pcvr_data(
         ``train_val_range=(train_min, train_max, valid_min, valid_max)``.
 
     When ``interval`` is True, rows are first filtered to
-    ``[time_range_start, time_range_end)``, and the requested split mode is then
+    ``[time_range_start, time_range_end]``, and the requested split mode is then
     applied to that sub-dataset.
 
     Returns:
@@ -876,10 +876,10 @@ def get_pcvr_data(
                 "--interval requires --time_range START END "
                 "(two Unix timestamps)")
         time_range_start, time_range_end = int(time_range[0]), int(time_range[1])
-        if time_range_start >= time_range_end:
+        if time_range_start > time_range_end:
             raise ValueError(
-                f"time_range start must be < end, got "
-                f"{time_range_start} >= {time_range_end}")
+                f"time_range start must be <= end, got "
+                f"{time_range_start} > {time_range_end}")
     if split_mode not in ('timestamp', 'rowgroup', 'manual_time'):
         raise ValueError(
             f"split_mode must be one of 'timestamp', 'rowgroup', 'manual_time', "
@@ -954,7 +954,7 @@ def get_pcvr_data(
     valid_timestamp_max: Optional[int] = None
 
     interval_min = time_range_start if interval else None
-    interval_max = time_range_end if interval else None
+    interval_max = (time_range_end + 1) if interval else None
     if split_mode == 'manual_time':
         train_row_groups = _filter_rg_info_by_timestamp(
             rg_info=rg_info,
@@ -987,7 +987,7 @@ def get_pcvr_data(
         if not split_rg_info:
             raise ValueError(
                 f"No rows found after applying interval filter "
-                f"[{time_range_start}, {time_range_end})")
+                f"[{time_range_start}, {time_range_end}]")
     total_rgs = len(split_rg_info)
 
     if split_mode == 'manual_time':
@@ -1125,7 +1125,7 @@ def get_pcvr_data(
     elif interval:
         logging.info(
             f"Parquet split_mode={split_mode}, interval=True, "
-            f"time_range=[{time_range_start}, {time_range_end}), "
+            f"time_range=[{time_range_start}, {time_range_end}], "
             f"sub_row_groups={total_rgs}, sub_rows={sum(r[2] for r in split_rg_info)}, "
             f"train: {train_rows} rows, valid: {valid_rows} rows, "
             f"timestamp_cutoff={timestamp_cutoff}, "

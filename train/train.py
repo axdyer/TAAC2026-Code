@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_range', type=int, nargs=2, default=None,
                         metavar=('START', 'END'),
                         help='Time range filter (Unix timestamps), used when --interval '
-                             'is set. Rows with START <= timestamp < END are kept.')
+                             'is set. Rows with START <= timestamp <= END are kept.')
     parser.add_argument('--train_val_range', type=int, nargs=4, default=None,
                         metavar=('TRAIN_MIN', 'TRAIN_MAX', 'VALID_MIN', 'VALID_MAX'),
                         help='Manual train/valid time ranges for '
@@ -358,10 +358,10 @@ def main() -> None:
             raise ValueError(
                 "--interval requires --time_range START END "
                 "(two Unix timestamps)")
-        if args.time_range[0] >= args.time_range[1]:
+        if args.time_range[0] > args.time_range[1]:
             raise ValueError(
-                f"--time_range start must be < end, got "
-                f"{args.time_range[0]} >= {args.time_range[1]}")
+                f"--time_range start must be <= end, got "
+                f"{args.time_range[0]} > {args.time_range[1]}")
     if args.split_mode == 'manual_time':
         if args.interval:
             raise ValueError(
