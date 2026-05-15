@@ -188,6 +188,7 @@ class RoPEMultiheadAttention(nn.Module):
         rope_sin: Optional[torch.Tensor] = None,
         q_rope_cos: Optional[torch.Tensor] = None,
         q_rope_sin: Optional[torch.Tensor] = None,
+        time_attn_bias: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> tuple:
         """Computes multi-head attention with optional RoPE.
@@ -204,6 +205,8 @@ class RoPEMultiheadAttention(nn.Module):
             q_rope_cos: (B, Lq, head_dim) or (1, Lq, head_dim), Q-specific
                 RoPE for cross-attention with gathered positions.
             q_rope_sin: Same shape as q_rope_cos.
+            time_attn_bias: Optional additive attention bias with shape
+                broadcastable to (B, num_heads, Lq, Lk).
             need_weights: Compatibility parameter, not used.
 
         Returns:
@@ -233,23 +236,46 @@ class RoPEMultiheadAttention(nn.Module):
                 q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
-        # 4. Convert key_padding_mask to SDPA format
-        sdpa_attn_mask = None
+        # 4. Convert key_padding_mask / attn_mask / additive bias to SDPA format
+        bool_attn_mask = None
         if key_padding_mask is not None:
             # key_padding_mask: (B, Lk), True = padding
             # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
-            sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
-            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            bool_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
+            bool_attn_mask = bool_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
             # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
             # Convert to bool: positions that are not -inf are True
             bool_attn = (attn_mask == 0)  # (Lq, Lk)
             bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
-            if sdpa_attn_mask is not None:
-                sdpa_attn_mask = sdpa_attn_mask & bool_attn
+            if bool_attn_mask is not None:
+                bool_attn_mask = bool_attn_mask & bool_attn
             else:
-                sdpa_attn_mask = bool_attn
+                bool_attn_mask = bool_attn
+
+        if time_attn_bias is not None:
+            if time_attn_bias.dim() != 4:
+                raise ValueError(
+                    f"time_attn_bias must have 4 dims, got shape {tuple(time_attn_bias.shape)}")
+            if time_attn_bias.shape[0] != B or time_attn_bias.shape[1] != self.num_heads:
+                raise ValueError(
+                    f"time_attn_bias shape {tuple(time_attn_bias.shape)} is incompatible "
+                    f"with batch={B}, num_heads={self.num_heads}")
+            if time_attn_bias.shape[2] not in (1, Lq) or time_attn_bias.shape[3] != Lk:
+                raise ValueError(
+                    f"time_attn_bias shape {tuple(time_attn_bias.shape)} must be "
+                    f"broadcastable to (B,H,Lq,Lk)=({B},{self.num_heads},{Lq},{Lk})")
+            sdpa_attn_mask = time_attn_bias.to(dtype=Q.dtype)
+            if time_attn_bias.shape[2] == 1 and Lq != 1:
+                sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            if bool_attn_mask is not None:
+                sdpa_attn_mask = sdpa_attn_mask.masked_fill(
+                    ~bool_attn_mask,
+                    torch.finfo(Q.dtype).min,
+                )
+        else:
+            sdpa_attn_mask = bool_attn_mask
 
         # 5. Scaled Dot-Product Attention
         dropout_p = self.dropout if self.training else 0.0
@@ -306,6 +332,7 @@ class CrossAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        time_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes cross-attention between query tokens and sequence tokens.
 
@@ -332,6 +359,7 @@ class CrossAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            time_attn_bias=time_attn_bias,
         )
 
         out = residual + out
@@ -610,6 +638,7 @@ class TransformerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        time_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies one Transformer encoder layer.
 
@@ -632,6 +661,7 @@ class TransformerEncoder(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            time_attn_bias=time_attn_bias,
         )
         x = residual + x
 
@@ -754,6 +784,7 @@ class LongerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        time_attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Applies the LongerEncoder with adaptive cross/self attention.
 
@@ -947,6 +978,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        time_attn_bias_list: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -974,9 +1006,10 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            tb = time_attn_bias_list[i] if time_attn_bias_list is not None else None
             result = self.seq_encoders[i](
                 seq_tokens_list[i], seq_padding_masks[i],
-                rope_cos=rc, rope_sin=rs,
+                rope_cos=rc, rope_sin=rs, time_attn_bias=tb,
             )
             next_seq_i, mask_i = result
             next_seqs.append(next_seq_i)
@@ -987,9 +1020,10 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            tb = time_attn_bias_list[i] if time_attn_bias_list is not None else None
             decoded_q_i = self.cross_attns[i](
                 q_tokens_list[i], next_seqs[i], next_masks[i],
-                rope_cos=rc, rope_sin=rs,
+                rope_cos=rc, rope_sin=rs, time_attn_bias=tb,
             )
             decoded_qs.append(decoded_q_i)
 
@@ -1256,6 +1290,8 @@ class PCVRHyFormer(nn.Module):
         sample_time_timezone_offset_hours: int = 8,
         use_domain_recency_fusion: bool = False,
         recency_stats_dim: int = 0,
+        use_time_attention_bias: bool = False,
+        time_attention_bias_domains: Optional[List[str]] = None,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1287,6 +1323,7 @@ class PCVRHyFormer(nn.Module):
         self.use_sample_time_token = use_sample_time_token
         self.use_domain_recency_fusion = bool(use_domain_recency_fusion)
         self.recency_stats_dim = int(recency_stats_dim)
+        self.use_time_attention_bias = bool(use_time_attention_bias)
         self.sample_time_ref_ts = int(sample_time_ref_ts)
         self.sample_time_timezone_offset_seconds = (
             int(sample_time_timezone_offset_hours) * 3600
@@ -1300,6 +1337,24 @@ class PCVRHyFormer(nn.Module):
         if self.use_domain_recency_fusion and self.recency_stats_dim <= 0:
             raise ValueError(
                 "use_domain_recency_fusion=True requires recency_stats_dim > 0")
+        if self.use_time_attention_bias:
+            if self.num_time_buckets <= 0:
+                raise ValueError("use_time_attention_bias=True requires num_time_buckets > 0")
+            if seq_encoder_type == 'longer':
+                raise ValueError(
+                    "use_time_attention_bias=True is not implemented for "
+                    "seq_encoder_type='longer' because sequence compression "
+                    "changes the key length across blocks")
+        if time_attention_bias_domains:
+            unknown_bias_domains = sorted(
+                set(time_attention_bias_domains) - set(self.seq_domains))
+            if unknown_bias_domains:
+                raise ValueError(
+                    f"time_attention_bias_domains contains unknown domains "
+                    f"{unknown_bias_domains}; known domains={self.seq_domains}")
+            self.time_attention_bias_domains = list(time_attention_bias_domains)
+        else:
+            self.time_attention_bias_domains = list(self.seq_domains)
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1622,6 +1677,12 @@ class PCVRHyFormer(nn.Module):
             else:
                 self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        if self.use_time_attention_bias:
+            self.time_attention_bias_embeddings = nn.ModuleDict({
+                domain: nn.Embedding(num_time_buckets, num_heads, padding_idx=0)
+                for domain in self.time_attention_bias_domains
+            })
+
         # Explicit per-domain recency statistics can modulate that domain's
         # sequence tokens without adding extra global tokens.
         if self.use_domain_recency_fusion:
@@ -1742,6 +1803,10 @@ class PCVRHyFormer(nn.Module):
             else:
                 nn.init.xavier_normal_(self.time_embedding.weight.data)
                 self.time_embedding.weight.data[0, :] = 0
+
+        if self.use_time_attention_bias:
+            for emb in self.time_attention_bias_embeddings.values():
+                nn.init.zeros_(emb.weight.data)
 
         if self.use_sample_time_token:
             nn.init.xavier_normal_(self.sample_time_recency_embedding.weight.data)
@@ -2061,12 +2126,26 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _make_time_attention_bias(
+        self,
+        domain: str,
+        time_bucket_ids: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_time_attention_bias:
+            return None
+        if domain not in self.time_attention_bias_embeddings:
+            return None
+        # (B, L, H) -> (B, H, 1, L), a key-side additive bias shared by all queries.
+        bias = self.time_attention_bias_embeddings[domain](time_bucket_ids)
+        return bias.permute(0, 2, 1).unsqueeze(2)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
+        time_attn_bias_list: Optional[List[Optional[torch.Tensor]]] = None,
         apply_dropout: bool = True
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
@@ -2101,6 +2180,7 @@ class PCVRHyFormer(nn.Module):
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                time_attn_bias_list=time_attn_bias_list,
             )
 
         # Output: concatenate all sequences' Q tokens then project via MLP
@@ -2134,6 +2214,7 @@ class PCVRHyFormer(nn.Module):
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
+        time_attn_bias_list = [] if self.use_time_attention_bias else None
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 domain,
@@ -2145,6 +2226,13 @@ class PCVRHyFormer(nn.Module):
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+            if time_attn_bias_list is not None:
+                time_attn_bias_list.append(
+                    self._make_time_attention_bias(
+                        domain,
+                        inputs.seq_time_buckets[domain],
+                    )
+                )
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
@@ -2152,6 +2240,7 @@ class PCVRHyFormer(nn.Module):
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            time_attn_bias_list=time_attn_bias_list,
             apply_dropout=self.training
         )
 
@@ -2181,6 +2270,7 @@ class PCVRHyFormer(nn.Module):
 
         seq_tokens_list = []
         seq_masks_list = []
+        time_attn_bias_list = [] if self.use_time_attention_bias else None
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 domain,
@@ -2192,11 +2282,19 @@ class PCVRHyFormer(nn.Module):
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+            if time_attn_bias_list is not None:
+                time_attn_bias_list.append(
+                    self._make_time_attention_bias(
+                        domain,
+                        inputs.seq_time_buckets[domain],
+                    )
+                )
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            time_attn_bias_list=time_attn_bias_list,
             apply_dropout=False
         )
 

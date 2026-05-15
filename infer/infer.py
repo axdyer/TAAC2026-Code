@@ -73,6 +73,8 @@ _FALLBACK_MODEL_CFG = {
     'sample_time_timezone_offset_hours': 8,
     'use_domain_recency_fusion': False,
     'recency_stats_dim': 0,
+    'use_time_attention_bias': False,
+    'time_attention_bias_domains': ['seq_a', 'seq_b', 'seq_c', 'seq_d'],
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,

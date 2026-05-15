@@ -77,6 +77,29 @@ def parse_user_feat_pair(value: str) -> List[int]:
     return result
 
 
+def parse_domain_list(value: str) -> List[str]:
+    s = value.strip()
+    if not s:
+        return []
+    if s.startswith('['):
+        parsed = json.loads(s)
+        if not isinstance(parsed, list):
+            raise ValueError("domain list JSON value must be a list")
+        domains = parsed
+    else:
+        domains = [part.strip() for part in s.split(',') if part.strip()]
+    result: List[str] = []
+    seen = set()
+    for domain in domains:
+        if not isinstance(domain, str) or not domain:
+            raise ValueError(f"domain list contains invalid domain: {domain!r}")
+        if domain in seen:
+            raise ValueError(f"domain list contains duplicate domain: {domain}")
+        seen.add(domain)
+        result.append(domain)
+    return result
+
+
 def _parse_positive_int_or_auto(value: str, arg_name: str) -> Union[int, str]:
     s = str(value).strip()
     if s == 'auto':
@@ -263,6 +286,14 @@ def parse_args() -> argparse.Namespace:
                         help='Strictly increasing second windows used by '
                              '--use_domain_recency_fusion for recent-event count '
                              'features.')
+    parser.add_argument('--use_time_attention_bias', action='store_true', default=False,
+                        help='Add a learnable key-side attention bias from each '
+                             'sequence event time bucket. Disabled by default.')
+    parser.add_argument('--time_attention_bias_domains', type=str,
+                        default='seq_a,seq_b,seq_c,seq_d',
+                        help='Comma-separated sequence domains that receive '
+                             'time attention bias when --use_time_attention_bias '
+                             'is enabled.')
 
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
@@ -350,6 +381,8 @@ def parse_args() -> argparse.Namespace:
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
     args.domain_recency_windows = parse_recency_windows(
         args.domain_recency_windows)
+    args.time_attention_bias_domains = parse_domain_list(
+        args.time_attention_bias_domains)
     if args.use_sample_time_token:
         args.sample_time_ref_ts = _parse_positive_int_or_auto(
             args.sample_time_ref_ts,
@@ -429,6 +462,17 @@ def main() -> None:
         raise ValueError(
             "--use_sample_time_token requires --sample_time_ref_ts to be set "
             "to a positive Unix timestamp or 'auto'")
+    if args.use_time_attention_bias:
+        if not args.use_time_buckets:
+            raise ValueError("--use_time_attention_bias requires --use_time_buckets")
+        if args.seq_encoder_type == 'longer':
+            raise ValueError(
+                "--use_time_attention_bias is not implemented with "
+                "--seq_encoder_type longer")
+        if not args.time_attention_bias_domains:
+            raise ValueError(
+                "--use_time_attention_bias requires at least one domain in "
+                "--time_attention_bias_domains")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -585,6 +629,8 @@ def main() -> None:
         "sample_time_timezone_offset_hours": args.sample_time_timezone_offset_hours,
         "use_domain_recency_fusion": args.use_domain_recency_fusion,
         "recency_stats_dim": args.recency_stats_dim,
+        "use_time_attention_bias": args.use_time_attention_bias,
+        "time_attention_bias_domains": args.time_attention_bias_domains,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
