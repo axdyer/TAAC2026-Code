@@ -25,6 +25,7 @@ from dataset import (
     HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES,
     get_pcvr_data,
     load_time_bucket_boundaries_json,
+    parse_recency_windows,
 )
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -253,6 +254,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sample_time_timezone_offset_hours', type=int, default=8,
                         help='Timezone offset used to derive local hour/day cyclical '
                              'features from timestamp. Beijing time = 8.')
+    parser.add_argument('--use_domain_recency_fusion', action='store_true', default=False,
+                        help='Inject explicit per-domain sequence recency statistics '
+                             'into that domain sequence tokens via gated residual '
+                             'fusion. Disabled by default.')
+    parser.add_argument('--domain_recency_windows', type=str,
+                        default='300,900,3600,21600,86400,259200,604800,2592000',
+                        help='Strictly increasing second windows used by '
+                             '--use_domain_recency_fusion for recent-event count '
+                             'features.')
 
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
@@ -338,6 +348,8 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
+    args.domain_recency_windows = parse_recency_windows(
+        args.domain_recency_windows)
     if args.use_sample_time_token:
         args.sample_time_ref_ts = _parse_positive_int_or_auto(
             args.sample_time_ref_ts,
@@ -496,9 +508,15 @@ def main() -> None:
         interval=args.interval,
         train_val_range=args.train_val_range,
         time_bucket_boundaries=time_bucket_boundaries,
+        use_domain_recency_stats=args.use_domain_recency_fusion,
+        domain_recency_windows=args.domain_recency_windows,
     )
     args.num_time_buckets = (
         pcvr_dataset.num_time_buckets if args.use_time_buckets else 0
+    )
+    args.recency_stats_dim = (
+        pcvr_dataset.domain_recency_stats_dim
+        if args.use_domain_recency_fusion else 0
     )
 
     if args.use_sample_time_token and args.sample_time_ref_ts == 'auto':
@@ -565,6 +583,8 @@ def main() -> None:
         "use_sample_time_token": args.use_sample_time_token,
         "sample_time_ref_ts": args.sample_time_ref_ts,
         "sample_time_timezone_offset_hours": args.sample_time_timezone_offset_hours,
+        "use_domain_recency_fusion": args.use_domain_recency_fusion,
+        "recency_stats_dim": args.recency_stats_dim,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,

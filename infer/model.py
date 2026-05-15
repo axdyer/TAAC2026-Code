@@ -17,6 +17,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_recency_stats: dict  # {domain: tensor [B, R]}
 
 
 SUPPORTED_POS_USER_PAIR_FIDS = {62, 63, 64, 65, 66}
@@ -1253,6 +1254,8 @@ class PCVRHyFormer(nn.Module):
         use_sample_time_token: bool = False,
         sample_time_ref_ts: int = 0,
         sample_time_timezone_offset_hours: int = 8,
+        use_domain_recency_fusion: bool = False,
+        recency_stats_dim: int = 0,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1282,6 +1285,8 @@ class PCVRHyFormer(nn.Module):
         self.num_time_buckets = num_time_buckets
         self.domain_time_buckets = domain_time_buckets
         self.use_sample_time_token = use_sample_time_token
+        self.use_domain_recency_fusion = bool(use_domain_recency_fusion)
+        self.recency_stats_dim = int(recency_stats_dim)
         self.sample_time_ref_ts = int(sample_time_ref_ts)
         self.sample_time_timezone_offset_seconds = (
             int(sample_time_timezone_offset_hours) * 3600
@@ -1292,6 +1297,9 @@ class PCVRHyFormer(nn.Module):
             raise ValueError(
                 "use_sample_time_token=True requires sample_time_ref_ts to be "
                 "a positive Unix timestamp")
+        if self.use_domain_recency_fusion and self.recency_stats_dim <= 0:
+            raise ValueError(
+                "use_domain_recency_fusion=True requires recency_stats_dim > 0")
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1614,6 +1622,19 @@ class PCVRHyFormer(nn.Module):
             else:
                 self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # Explicit per-domain recency statistics can modulate that domain's
+        # sequence tokens without adding extra global tokens.
+        if self.use_domain_recency_fusion:
+            self.domain_recency_projs = nn.ModuleDict({
+                domain: nn.Linear(self.recency_stats_dim, 2 * d_model)
+                for domain in self.seq_domains
+            })
+            self.domain_recency_norms = nn.ModuleDict({
+                domain: nn.LayerNorm(d_model)
+                for domain in self.seq_domains
+            })
+            self.domain_recency_dropout = nn.Dropout(dropout_rate)
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1724,6 +1745,11 @@ class PCVRHyFormer(nn.Module):
 
         if self.use_sample_time_token:
             nn.init.xavier_normal_(self.sample_time_recency_embedding.weight.data)
+
+        if self.use_domain_recency_fusion:
+            for proj in self.domain_recency_projs.values():
+                nn.init.zeros_(proj.weight.data)
+                nn.init.zeros_(proj.bias.data)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1988,6 +2014,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        recency_stats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -2012,6 +2039,17 @@ class PCVRHyFormer(nn.Module):
                 token_emb = token_emb + self.time_embeddings[domain](time_bucket_ids)
             else:
                 token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        if self.use_domain_recency_fusion:
+            if recency_stats is None:
+                raise KeyError(
+                    f"use_domain_recency_fusion=True requires recency stats for {domain}")
+            fused = self.domain_recency_projs[domain](recency_stats.float())
+            gate, delta = fused.chunk(2, dim=-1)
+            gate = torch.sigmoid(gate).unsqueeze(1)
+            delta = F.silu(delta).unsqueeze(1)
+            delta = self.domain_recency_dropout(delta)
+            token_emb = self.domain_recency_norms[domain](token_emb + gate * delta)
 
         return token_emb
 
@@ -2102,7 +2140,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_recency_stats[domain] if self.use_domain_recency_fusion else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2148,7 +2187,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_recency_stats[domain] if self.use_domain_recency_fusion else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

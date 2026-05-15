@@ -131,6 +131,50 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+DEFAULT_DOMAIN_RECENCY_WINDOWS = (
+    300,       # 5 minutes
+    900,       # 15 minutes
+    3600,      # 1 hour
+    21600,     # 6 hours
+    86400,     # 1 day
+    259200,    # 3 days
+    604800,    # 7 days
+    2592000,   # 30 days
+)
+
+
+def parse_recency_windows(value: Any) -> List[int]:
+    if value is None:
+        return list(DEFAULT_DOMAIN_RECENCY_WINDOWS)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("recency windows string must not be empty")
+        values = [part.strip() for part in stripped.split(',') if part.strip()]
+    elif isinstance(value, list):
+        values = value
+    elif isinstance(value, tuple):
+        values = list(value)
+    else:
+        raise ValueError(
+            f"recency windows must be a comma-separated string or list, got {type(value).__name__}")
+
+    result: List[int] = []
+    prev = 0
+    for idx, raw in enumerate(values):
+        if isinstance(raw, bool):
+            raise ValueError(f"recency window at index {idx} must be an integer, got {raw!r}")
+        window = int(raw)
+        if window <= 0:
+            raise ValueError(f"recency window at index {idx} must be positive, got {window}")
+        if window <= prev:
+            raise ValueError(
+                f"recency windows must be strictly increasing; {window} <= {prev}")
+        result.append(window)
+        prev = window
+    if not result:
+        raise ValueError("recency windows must not be empty")
+    return result
 
 # Domain-specific time-delta bucket boundaries used when
 # ``--time_bucket_boundaries_json ""`` is passed. Keep every domain list the
@@ -274,6 +318,8 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         time_bucket_boundaries: Optional[Dict[str, List[int]]] = None,
+        use_domain_recency_stats: bool = False,
+        domain_recency_windows: Optional[List[int]] = None,
     ) -> None:
         """
         Args:
@@ -301,6 +347,10 @@ class PCVRParquetDataset(IterableDataset):
                 if False, return an all-zeros label column.
             time_bucket_boundaries: optional domain-specific bucket boundaries.
                 When omitted, the legacy shared ``BUCKET_BOUNDARIES`` are used.
+            use_domain_recency_stats: whether to emit per-domain explicit
+                recency statistics derived from sequence timestamps.
+            domain_recency_windows: increasing second windows used for count
+                statistics when ``use_domain_recency_stats`` is enabled.
         """
         super().__init__()
 
@@ -325,6 +375,12 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.use_domain_recency_stats = bool(use_domain_recency_stats)
+        self.domain_recency_windows = np.array(
+            parse_recency_windows(domain_recency_windows),
+            dtype=np.int64,
+        )
+        self.domain_recency_stats_dim = 4 + len(self.domain_recency_windows)
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max
         self._timestamp_filter_enabled = (
@@ -425,6 +481,10 @@ class PCVRParquetDataset(IterableDataset):
                 side_plan.append((ci, slot, vs))
             ts_ci = self._col_idx.get(f'{prefix}_{ts_fid}') if ts_fid is not None else None
             self._seq_plan[domain] = (side_plan, ts_ci)
+            if self.use_domain_recency_stats and ts_ci is None:
+                raise KeyError(
+                    f"use_domain_recency_stats=True requires timestamp column "
+                    f"for {domain}, but {prefix}_{ts_fid} is missing")
 
         logging.info(
             f"PCVRParquetDataset: {self.num_rows} rows from "
@@ -714,6 +774,46 @@ class PCVRParquetDataset(IterableDataset):
         else:
             logging.info(msg)
 
+    def _compute_domain_recency_stats(
+        self,
+        time_diff: "npt.NDArray[np.int64]",
+        valid_mask: "npt.NDArray[np.bool_]",
+    ) -> "npt.NDArray[np.float32]":
+        """Build explicit per-domain sequence recency statistics.
+
+        Features are log1p-scaled to keep magnitudes bounded:
+        ``[valid_count, min_age, mean_age, max_age, count<=window_1, ...]``.
+        """
+        B = time_diff.shape[0]
+        stats = np.zeros((B, self.domain_recency_stats_dim), dtype=np.float32)
+        valid_count = valid_mask.sum(axis=1).astype(np.float32)
+        has_valid = valid_count > 0
+        stats[:, 0] = np.log1p(valid_count)
+        if not has_valid.any():
+            return stats
+
+        ages = np.where(valid_mask, time_diff, 0).astype(np.float32)
+        min_source = np.where(valid_mask, time_diff, np.iinfo(np.int64).max)
+        min_age = np.where(has_valid, min_source.min(axis=1), 0)
+        max_age = np.where(
+            has_valid,
+            np.where(valid_mask, time_diff, 0).max(axis=1),
+            0,
+        )
+        sum_age = ages.sum(axis=1)
+        mean_age = np.zeros(B, dtype=np.float32)
+        mean_age[has_valid] = sum_age[has_valid] / valid_count[has_valid]
+
+        stats[:, 1] = np.log1p(min_age.astype(np.float32))
+        stats[:, 2] = np.log1p(mean_age)
+        stats[:, 3] = np.log1p(max_age.astype(np.float32))
+
+        for idx, window in enumerate(self.domain_recency_windows):
+            count = ((time_diff <= int(window)) & valid_mask).sum(axis=1)
+            stats[:, 4 + idx] = np.log1p(count.astype(np.float32))
+
+        return stats
+
     def _pad_varlen_int_column(
         self,
         arrow_col: "pa.ListArray",
@@ -846,6 +946,7 @@ class PCVRParquetDataset(IterableDataset):
         seq_data_dict: Dict[str, torch.Tensor] = {}
         seq_lens_dict: Dict[str, torch.Tensor] = {}
         seq_tb_dict: Dict[str, torch.Tensor] = {}
+        seq_recency_dict: Dict[str, torch.Tensor] = {}
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
@@ -913,6 +1014,7 @@ class PCVRParquetDataset(IterableDataset):
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
+                valid_ts_mask = ts_padded > 0
                 # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
                 # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
                 # the upper bound only appears when time_diff exceeds the
@@ -930,6 +1032,13 @@ class PCVRParquetDataset(IterableDataset):
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
+                if self.use_domain_recency_stats:
+                    recency_stats = self._compute_domain_recency_stats(
+                        time_diff,
+                        valid_ts_mask,
+                    )
+                    seq_recency_dict[f'{domain}_recency_stats'] = torch.from_numpy(
+                        recency_stats)
 
             seq_tb_dict[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
@@ -948,6 +1057,7 @@ class PCVRParquetDataset(IterableDataset):
         result.update(seq_data_dict)
         result.update(seq_lens_dict)
         result.update(seq_tb_dict)
+        result.update(seq_recency_dict)
 
         return result
 
@@ -994,6 +1104,8 @@ def get_pcvr_data(
     time_range = kwargs.get('time_range', None)
     train_val_range = kwargs.get('train_val_range', None)
     time_bucket_boundaries = kwargs.get('time_bucket_boundaries', None)
+    use_domain_recency_stats = kwargs.get('use_domain_recency_stats', False)
+    domain_recency_windows = kwargs.get('domain_recency_windows', None)
     time_range_start: Optional[int] = None
     time_range_end: Optional[int] = None
     if interval:
@@ -1189,6 +1301,8 @@ def get_pcvr_data(
         known_num_rows=train_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
         time_bucket_boundaries=time_bucket_boundaries,
+        use_domain_recency_stats=use_domain_recency_stats,
+        domain_recency_windows=domain_recency_windows,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1216,6 +1330,8 @@ def get_pcvr_data(
         known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
         time_bucket_boundaries=time_bucket_boundaries,
+        use_domain_recency_stats=use_domain_recency_stats,
+        domain_recency_windows=domain_recency_windows,
     )
 
     for split_name, dataset in (

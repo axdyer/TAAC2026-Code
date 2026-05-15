@@ -32,6 +32,7 @@ from dataset import (
     PCVRParquetDataset,
     NUM_TIME_BUCKETS,
     load_time_bucket_boundaries_json,
+    parse_recency_windows,
 )
 from model import PCVRHyFormer, ModelInput
 
@@ -70,6 +71,8 @@ _FALLBACK_MODEL_CFG = {
     'use_sample_time_token': False,
     'sample_time_ref_ts': 0,
     'sample_time_timezone_offset_hours': 8,
+    'use_domain_recency_fusion': False,
+    'recency_stats_dim': 0,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -298,6 +301,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_recency_stats: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -305,6 +309,8 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        if f'{domain}_recency_stats' in device_batch:
+            seq_recency_stats[domain] = device_batch[f'{domain}_recency_stats']
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -315,6 +321,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_recency_stats=seq_recency_stats,
     )
 
 
@@ -393,6 +400,10 @@ def main() -> None:
         raise RuntimeError(
             "time_bucket_boundaries are present in train_config but "
             "domain_time_buckets is not enabled; this configuration is invalid.")
+    use_domain_recency_fusion = bool(
+        train_config.get('use_domain_recency_fusion', False))
+    domain_recency_windows = parse_recency_windows(
+        train_config.get('domain_recency_windows', None))
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -403,6 +414,8 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         time_bucket_boundaries=time_bucket_boundaries,
+        use_domain_recency_stats=use_domain_recency_fusion,
+        domain_recency_windows=domain_recency_windows,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
