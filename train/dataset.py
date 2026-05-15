@@ -132,6 +132,121 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Domain-specific time-delta bucket boundaries used when
+# ``--time_bucket_boundaries_json ""`` is passed. Keep every domain list the
+# same length because the model has one shared ``num_time_buckets`` value.
+HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES: Dict[str, List[int]] = {
+    "seq_a": [
+        60, 300, 900, 3600, 21600, 86400, 259200, 604800, 1209600,
+        2592000, 3888000, 5184000, 7776000, 10368000, 12096000,
+        15552000, 21600000, 31536000, 51840000, 63072000,
+    ],
+    "seq_b": [
+        60, 300, 900, 3600, 21600, 86400, 172800, 432000, 604800,
+        1209600, 2592000, 5184000, 7776000, 10368000, 12096000,
+        15552000, 21600000, 31536000, 51840000, 63072000,
+    ],
+    "seq_c": [
+        60, 300, 900, 3600, 21600, 86400, 259200, 604800, 1209600,
+        2592000, 5184000, 7776000, 10368000, 15552000, 21600000,
+        31536000, 38880000, 46656000, 54432000, 63072000,
+    ],
+    "seq_d": [
+        60, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200,
+        86400, 172800, 259200, 432000, 604800, 864000, 1209600,
+        1814400, 2592000, 3888000, 7776000,
+    ],
+}
+
+
+def _validate_bucket_boundary_list(
+    values: Any,
+    name: str,
+) -> List[int]:
+    if not isinstance(values, list):
+        raise ValueError(f"{name} must be a list of positive integer boundaries")
+    if not values:
+        raise ValueError(f"{name} must not be empty")
+    result: List[int] = []
+    prev = 0
+    for idx, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"{name}[{idx}] must be an integer boundary, got {value!r}")
+        if value <= 0:
+            raise ValueError(
+                f"{name}[{idx}] must be positive, got {value}")
+        if value <= prev:
+            raise ValueError(
+                f"{name} must be strictly increasing; "
+                f"boundary {value} at index {idx} is <= previous {prev}")
+        result.append(int(value))
+        prev = int(value)
+    return result
+
+
+def load_time_bucket_boundaries_json(path: str) -> Dict[str, List[int]]:
+    """Load domain-specific time-delta bucket boundaries from JSON.
+
+    The JSON must be a mapping from every sequence domain name (for example
+    ``seq_a``) to a strictly increasing list of positive integer second values.
+    Exact domain coverage is validated after ``schema.json`` is loaded, because
+    the schema is the source of truth for available domains.
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"time bucket boundaries JSON must be an object, got {type(raw).__name__}")
+    return {
+        str(domain): _validate_bucket_boundary_list(values, str(domain))
+        for domain, values in raw.items()
+    }
+
+
+def normalize_time_bucket_boundaries(
+    seq_domains: List[str],
+    boundaries_by_domain: Optional[Dict[str, List[int]]] = None,
+) -> Tuple[Dict[str, npt.NDArray[np.int64]], int]:
+    """Validate and materialize time bucket boundaries for every sequence domain.
+
+    When ``boundaries_by_domain`` is ``None``, every domain uses the legacy
+    shared ``BUCKET_BOUNDARIES`` and the resulting behavior is exactly the
+    original code path.
+    """
+    if boundaries_by_domain is None:
+        return {
+            domain: BUCKET_BOUNDARIES
+            for domain in seq_domains
+        }, NUM_TIME_BUCKETS
+
+    expected_domains = set(seq_domains)
+    provided_domains = set(boundaries_by_domain.keys())
+    missing = sorted(expected_domains - provided_domains)
+    extra = sorted(provided_domains - expected_domains)
+    if missing or extra:
+        raise ValueError(
+            "time bucket boundaries JSON domain mismatch: "
+            f"missing={missing}, extra={extra}, expected={sorted(expected_domains)}")
+
+    normalized: Dict[str, npt.NDArray[np.int64]] = {}
+    boundary_count: Optional[int] = None
+    for domain in seq_domains:
+        values = _validate_bucket_boundary_list(
+            boundaries_by_domain[domain],
+            f"time_bucket_boundaries[{domain!r}]",
+        )
+        if boundary_count is None:
+            boundary_count = len(values)
+        elif len(values) != boundary_count:
+            raise ValueError(
+                "all domain-specific time bucket boundary lists must have the "
+                f"same length; {domain} has {len(values)}, expected {boundary_count}")
+        normalized[domain] = np.array(values, dtype=np.int64)
+
+    assert boundary_count is not None
+    return normalized, boundary_count + 1
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -158,6 +273,7 @@ class PCVRParquetDataset(IterableDataset):
         known_num_rows: Optional[int] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        time_bucket_boundaries: Optional[Dict[str, List[int]]] = None,
     ) -> None:
         """
         Args:
@@ -183,6 +299,8 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            time_bucket_boundaries: optional domain-specific bucket boundaries.
+                When omitted, the legacy shared ``BUCKET_BOUNDARIES`` are used.
         """
         super().__init__()
 
@@ -241,6 +359,12 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+        self.time_bucket_boundaries, self.num_time_buckets = (
+            normalize_time_bucket_boundaries(
+                self.seq_domains,
+                time_bucket_boundaries,
+            )
+        )
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -798,9 +922,10 @@ class PCVRParquetDataset(IterableDataset):
                 # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
                 # and is always a valid Embedding index. Time-diffs beyond the
                 # largest boundary collapse into the last bucket.
+                boundaries = self.time_bucket_boundaries[domain]
                 raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
+                    np.searchsorted(boundaries, time_diff.ravel()),
+                    0, len(boundaries) - 1,
                 )
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
@@ -868,6 +993,7 @@ def get_pcvr_data(
     interval: bool = kwargs.get('interval', False)
     time_range = kwargs.get('time_range', None)
     train_val_range = kwargs.get('train_val_range', None)
+    time_bucket_boundaries = kwargs.get('time_bucket_boundaries', None)
     time_range_start: Optional[int] = None
     time_range_end: Optional[int] = None
     if interval:
@@ -1062,6 +1188,7 @@ def get_pcvr_data(
         timestamp_max=train_timestamp_max,
         known_num_rows=train_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1088,6 +1215,7 @@ def get_pcvr_data(
         timestamp_max=valid_timestamp_max,
         known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
 
     for split_name, dataset in (

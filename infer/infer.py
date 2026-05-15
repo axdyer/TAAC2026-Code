@@ -26,7 +26,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES,
+    PCVRParquetDataset,
+    NUM_TIME_BUCKETS,
+    load_time_bucket_boundaries_json,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -340,6 +346,53 @@ def main() -> None:
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    time_bucket_boundaries = None
+    time_bucket_boundaries_json = train_config.get(
+        'time_bucket_boundaries_json', None)
+    serialized_time_bucket_boundaries = train_config.get(
+        'time_bucket_boundaries', None)
+    if time_bucket_boundaries_json is None:
+        if serialized_time_bucket_boundaries is not None:
+            raise RuntimeError(
+                "train_config contains serialized time_bucket_boundaries but "
+                "time_bucket_boundaries_json is absent; this ambiguous config "
+                "is rejected.")
+    elif time_bucket_boundaries_json == "":
+        time_bucket_boundaries = {
+            domain: list(boundaries)
+            for domain, boundaries in HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES.items()
+        }
+        if (
+            serialized_time_bucket_boundaries is not None
+            and serialized_time_bucket_boundaries != time_bucket_boundaries
+        ):
+            raise RuntimeError(
+                "train_config hardcoded time bucket boundaries do not match "
+                "infer/dataset.py HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES.")
+    else:
+        json_candidate = (
+            time_bucket_boundaries_json
+            if os.path.isabs(time_bucket_boundaries_json)
+            else os.path.join(model_dir, time_bucket_boundaries_json)
+        )
+        if not os.path.exists(json_candidate):
+            raise FileNotFoundError(
+                "train_config indicates an external domain-specific time "
+                f"bucket JSON was used, but it was not found at {json_candidate}. "
+                "Upload/copy the same JSON file next to train_config.json.")
+        time_bucket_boundaries = load_time_bucket_boundaries_json(
+            json_candidate)
+        if (
+            serialized_time_bucket_boundaries is not None
+            and serialized_time_bucket_boundaries != time_bucket_boundaries
+        ):
+            raise RuntimeError(
+                "time bucket boundaries loaded from JSON do not match the "
+                "serialized time_bucket_boundaries in train_config.")
+    if time_bucket_boundaries is not None and not train_config.get('domain_time_buckets', False):
+        raise RuntimeError(
+            "time_bucket_boundaries are present in train_config but "
+            "domain_time_buckets is not enabled; this configuration is invalid.")
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -349,6 +402,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

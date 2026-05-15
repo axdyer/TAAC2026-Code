@@ -274,7 +274,8 @@ class PCVRHyFormerRankingTrainer:
     def _write_sidecar_files(self, ckpt_dir: str) -> None:
         """Write sidecar files next to a ``model.pt``.
 
-        Currently persists up to three files, all overwritten on every call:
+        Currently persists sidecar files next to the weights, all overwritten
+        on every call:
 
         - ``schema.json`` (copied from ``self.schema_path``): feature layout
           metadata needed to rebuild the Parquet dataset.
@@ -289,6 +290,10 @@ class PCVRHyFormerRankingTrainer:
           rewritten to the bare filename so that ``infer.py`` resolves it
           against ``ckpt_dir`` rather than the original absolute path on
           the training machine.
+        - custom time-bucket JSON (copied from ``time_bucket_boundaries_json``
+          when it is a non-empty path): domain-specific time bucket boundaries
+          used by both train and infer. Empty string means the built-in
+          hardcoded boundaries are used and no external file is needed.
         """
         os.makedirs(ckpt_dir, exist_ok=True)
         if self.schema_path and os.path.exists(self.schema_path):
@@ -299,17 +304,33 @@ class PCVRHyFormerRankingTrainer:
             shutil.copy2(self.ns_groups_path, ckpt_dir)
             ns_groups_copied = True
 
+        time_bucket_json_copied_path: Optional[str] = None
+        if self.train_config:
+            time_bucket_json_path = self.train_config.get(
+                'time_bucket_boundaries_json')
+            if time_bucket_json_path:
+                if not os.path.exists(time_bucket_json_path):
+                    raise FileNotFoundError(
+                        "time_bucket_boundaries_json was set during training "
+                        f"but the file does not exist: {time_bucket_json_path}"
+                    )
+                shutil.copy2(time_bucket_json_path, ckpt_dir)
+                time_bucket_json_copied_path = os.path.basename(
+                    time_bucket_json_path)
+
         if self.train_config:
             import json
-            cfg_to_dump = self.train_config
+            cfg_to_dump = dict(self.train_config)
             if ns_groups_copied:
                 # Override the stored path to a filename relative to ckpt_dir;
                 # infer.py already falls back to `<ckpt_dir>/<basename>` when
                 # the recorded path is not absolute, which keeps the ckpt
                 # portable across hosts.
-                cfg_to_dump = dict(self.train_config)
                 cfg_to_dump['ns_groups_json'] = os.path.basename(
                     self.ns_groups_path)
+            if time_bucket_json_copied_path is not None:
+                cfg_to_dump['time_bucket_boundaries_json'] = (
+                    time_bucket_json_copied_path)
             with open(os.path.join(ckpt_dir, 'train_config.json'), 'w') as f:
                 json.dump(cfg_to_dump, f, indent=2)
 

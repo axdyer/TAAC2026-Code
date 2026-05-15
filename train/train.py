@@ -20,7 +20,12 @@ from typing import List, Tuple, Union
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES,
+    get_pcvr_data,
+    load_time_bucket_boundaries_json,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -224,6 +229,16 @@ def parse_args() -> argparse.Namespace:
                              'sequence domain instead of sharing one Embedding '
                              'across seq_a/seq_b/seq_c/seq_d. Requires time '
                              'buckets to be enabled.')
+    parser.add_argument('--time_bucket_boundaries_json', type=str, nargs='?',
+                        const='', default=None,
+                        help='Optional JSON file with domain-specific time-delta '
+                             'bucket boundaries in seconds. The file must contain '
+                             'exactly one strictly increasing integer list per '
+                             'sequence domain. Requires --domain_time_buckets. '
+                             'If passed without a value or as an empty string, '
+                             'use the hardcoded domain-specific boundaries in '
+                             'dataset.py. If the argument is omitted, custom '
+                             'boundaries are disabled.')
     parser.add_argument('--use_sample_time_token', action='store_true', default=False,
                         help='Append one sample-level timestamp token to the NS '
                              'token set. This changes T and may require adjusting '
@@ -393,6 +408,11 @@ def main() -> None:
         raise ValueError("--train_val_range is only valid with --split_mode manual_time")
     if args.domain_time_buckets and not args.use_time_buckets:
         raise ValueError("--domain_time_buckets requires --use_time_buckets")
+    if args.time_bucket_boundaries_json is not None:
+        if not args.use_time_buckets:
+            raise ValueError("--time_bucket_boundaries_json requires --use_time_buckets")
+        if not args.domain_time_buckets:
+            raise ValueError("--time_bucket_boundaries_json requires --domain_time_buckets")
     if args.use_sample_time_token and args.sample_time_ref_ts == 0:
         raise ValueError(
             "--use_sample_time_token requires --sample_time_ref_ts to be set "
@@ -407,6 +427,29 @@ def main() -> None:
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
+
+    time_bucket_boundaries = None
+    if args.time_bucket_boundaries_json is None:
+        args.time_bucket_boundaries = None
+    elif args.time_bucket_boundaries_json == "":
+        time_bucket_boundaries = {
+            domain: list(boundaries)
+            for domain, boundaries in HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES.items()
+        }
+        args.time_bucket_boundaries = time_bucket_boundaries
+        logging.info(
+            "Using hardcoded domain-specific time bucket boundaries: %s",
+            {k: len(v) for k, v in time_bucket_boundaries.items()},
+        )
+    else:
+        time_bucket_boundaries = load_time_bucket_boundaries_json(
+            args.time_bucket_boundaries_json)
+        args.time_bucket_boundaries = time_bucket_boundaries
+        logging.info(
+            "Loaded domain-specific time bucket boundaries from %s: %s",
+            args.time_bucket_boundaries_json,
+            {k: len(v) for k, v in time_bucket_boundaries.items()},
+        )
 
     if args.allow_tf32:
         if not args.device.startswith('cuda') or not torch.cuda.is_available():
@@ -452,6 +495,10 @@ def main() -> None:
         time_range=args.time_range,
         interval=args.interval,
         train_val_range=args.train_val_range,
+        time_bucket_boundaries=time_bucket_boundaries,
+    )
+    args.num_time_buckets = (
+        pcvr_dataset.num_time_buckets if args.use_time_buckets else 0
     )
 
     if args.use_sample_time_token and args.sample_time_ref_ts == 'auto':
@@ -513,7 +560,7 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
-        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "num_time_buckets": args.num_time_buckets,
         "domain_time_buckets": args.domain_time_buckets,
         "use_sample_time_token": args.use_sample_time_token,
         "sample_time_ref_ts": args.sample_time_ref_ts,
