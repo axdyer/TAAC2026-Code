@@ -1290,6 +1290,7 @@ class PCVRHyFormer(nn.Module):
         sample_time_timezone_offset_hours: int = 8,
         use_domain_recency_fusion: bool = False,
         recency_stats_dim: int = 0,
+        recency_stats_dims: Optional[dict] = None,
         use_time_attention_bias: bool = False,
         time_attention_bias_domains: Optional[List[str]] = None,
         rank_mixer_mode: str = 'full',
@@ -1323,6 +1324,20 @@ class PCVRHyFormer(nn.Module):
         self.use_sample_time_token = use_sample_time_token
         self.use_domain_recency_fusion = bool(use_domain_recency_fusion)
         self.recency_stats_dim = int(recency_stats_dim)
+        if recency_stats_dims is None:
+            self.recency_stats_dims = (
+                {domain: self.recency_stats_dim for domain in self.seq_domains}
+                if self.recency_stats_dim > 0 else {}
+            )
+        else:
+            if not isinstance(recency_stats_dims, dict):
+                raise ValueError(
+                    "recency_stats_dims must be a dict keyed by sequence domain, "
+                    f"got {type(recency_stats_dims).__name__}")
+            self.recency_stats_dims = {
+                str(domain): int(dim)
+                for domain, dim in recency_stats_dims.items()
+            }
         self.use_time_attention_bias = bool(use_time_attention_bias)
         self.sample_time_ref_ts = int(sample_time_ref_ts)
         self.sample_time_timezone_offset_seconds = (
@@ -1334,9 +1349,21 @@ class PCVRHyFormer(nn.Module):
             raise ValueError(
                 "use_sample_time_token=True requires sample_time_ref_ts to be "
                 "a positive Unix timestamp")
-        if self.use_domain_recency_fusion and self.recency_stats_dim <= 0:
-            raise ValueError(
-                "use_domain_recency_fusion=True requires recency_stats_dim > 0")
+        if self.use_domain_recency_fusion:
+            expected_domains = set(self.seq_domains)
+            provided_domains = set(self.recency_stats_dims.keys())
+            missing = sorted(expected_domains - provided_domains)
+            extra = sorted(provided_domains - expected_domains)
+            bad_dims = {
+                domain: dim
+                for domain, dim in self.recency_stats_dims.items()
+                if dim <= 0
+            }
+            if missing or extra or bad_dims:
+                raise ValueError(
+                    "use_domain_recency_fusion=True requires positive "
+                    "recency_stats_dims for every sequence domain; "
+                    f"missing={missing}, extra={extra}, bad_dims={bad_dims}")
         if self.use_time_attention_bias:
             if self.num_time_buckets <= 0:
                 raise ValueError("use_time_attention_bias=True requires num_time_buckets > 0")
@@ -1687,7 +1714,7 @@ class PCVRHyFormer(nn.Module):
         # sequence tokens without adding extra global tokens.
         if self.use_domain_recency_fusion:
             self.domain_recency_projs = nn.ModuleDict({
-                domain: nn.Linear(self.recency_stats_dim, 2 * d_model)
+                domain: nn.Linear(self.recency_stats_dims[domain], 2 * d_model)
                 for domain in self.seq_domains
             })
             self.domain_recency_norms = nn.ModuleDict({
@@ -2109,6 +2136,11 @@ class PCVRHyFormer(nn.Module):
             if recency_stats is None:
                 raise KeyError(
                     f"use_domain_recency_fusion=True requires recency stats for {domain}")
+            expected_dim = self.recency_stats_dims[domain]
+            if recency_stats.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"recency stats dim mismatch for {domain}: "
+                    f"got {recency_stats.shape[-1]}, expected {expected_dim}")
             fused = self.domain_recency_projs[domain](recency_stats.float())
             gate, delta = fused.chunk(2, dim=-1)
             gate = torch.sigmoid(gate).unsqueeze(1)

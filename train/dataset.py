@@ -142,39 +142,145 @@ DEFAULT_DOMAIN_RECENCY_WINDOWS = (
     2592000,   # 30 days
 )
 
+HARDCODED_DOMAIN_RECENCY_WINDOWS: Dict[str, Tuple[int, ...]] = {
+    # Probe-derived windows. Keep these intentionally asymmetric: seq_c carries
+    # much older history, while seq_d is dominated by near-term dense behavior.
+    "seq_a": (
+        3600,      # 1 hour
+        21600,     # 6 hours
+        86400,     # 1 day
+        259200,    # 3 days
+        604800,    # 7 days
+        2592000,   # 30 days
+        7776000,   # 90 days
+        15552000,  # 180 days
+    ),
+    "seq_b": (
+        3600,
+        21600,
+        86400,
+        259200,
+        604800,
+        2592000,
+        7776000,
+        15552000,
+    ),
+    "seq_c": (
+        3600,
+        21600,
+        86400,
+        259200,
+        604800,
+        2592000,
+        7776000,
+        15552000,
+        31104000,  # 360 days
+        51840000,  # 600 days
+    ),
+    "seq_d": (
+        300,       # 5 minutes
+        900,       # 15 minutes
+        3600,
+        21600,
+        86400,
+        259200,
+        604800,
+        2592000,
+    ),
+}
 
-def parse_recency_windows(value: Any) -> List[int]:
+
+def _validate_recency_window_list(values: Any, name: str) -> List[int]:
+    if isinstance(values, tuple):
+        values = list(values)
+    if not isinstance(values, list):
+        raise ValueError(
+            f"{name} must be a list of positive integers, got {type(values).__name__}")
+    result: List[int] = []
+    prev = 0
+    for idx, raw in enumerate(values):
+        if isinstance(raw, bool):
+            raise ValueError(f"{name}[{idx}] must be an integer, got {raw!r}")
+        window = int(raw)
+        if window <= 0:
+            raise ValueError(f"{name}[{idx}] must be positive, got {window}")
+        if window <= prev:
+            raise ValueError(
+                f"{name} must be strictly increasing; {window} <= {prev}")
+        result.append(window)
+        prev = window
+    if not result:
+        raise ValueError(f"{name} must not be empty")
+    return result
+
+
+def parse_recency_windows(value: Any) -> Any:
     if value is None:
         return list(DEFAULT_DOMAIN_RECENCY_WINDOWS)
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             raise ValueError("recency windows string must not be empty")
+        if stripped in {"domain_specific", "probe", "hardcoded"}:
+            return {
+                domain: list(windows)
+                for domain, windows in HARDCODED_DOMAIN_RECENCY_WINDOWS.items()
+            }
+        if stripped.startswith("{") or stripped.startswith("["):
+            return parse_recency_windows(json.loads(stripped))
+        if os.path.exists(stripped):
+            with open(stripped, 'r', encoding='utf-8') as f:
+                return parse_recency_windows(json.load(f))
+        if stripped.endswith(".json"):
+            raise FileNotFoundError(f"recency windows JSON not found: {stripped}")
         values = [part.strip() for part in stripped.split(',') if part.strip()]
-    elif isinstance(value, list):
-        values = value
-    elif isinstance(value, tuple):
-        values = list(value)
-    else:
-        raise ValueError(
-            f"recency windows must be a comma-separated string or list, got {type(value).__name__}")
+        return _validate_recency_window_list(values, "recency windows")
+    if isinstance(value, dict):
+        if not value:
+            raise ValueError("domain-specific recency windows must not be empty")
+        return {
+            str(domain): _validate_recency_window_list(
+                windows, f"domain_recency_windows[{domain!r}]")
+            for domain, windows in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return _validate_recency_window_list(list(value), "recency windows")
+    raise ValueError(
+        f"recency windows must be a comma-separated string, JSON list, JSON object, "
+        f"or file path, got {type(value).__name__}")
 
-    result: List[int] = []
-    prev = 0
-    for idx, raw in enumerate(values):
-        if isinstance(raw, bool):
-            raise ValueError(f"recency window at index {idx} must be an integer, got {raw!r}")
-        window = int(raw)
-        if window <= 0:
-            raise ValueError(f"recency window at index {idx} must be positive, got {window}")
-        if window <= prev:
+
+def normalize_domain_recency_windows(
+    seq_domains: List[str],
+    windows: Any,
+) -> Tuple[Dict[str, npt.NDArray[np.int64]], Dict[str, int]]:
+    parsed = parse_recency_windows(windows)
+    if isinstance(parsed, list):
+        by_domain = {domain: parsed for domain in seq_domains}
+    elif isinstance(parsed, dict):
+        expected_domains = set(seq_domains)
+        provided_domains = set(parsed.keys())
+        missing = sorted(expected_domains - provided_domains)
+        extra = sorted(provided_domains - expected_domains)
+        if missing or extra:
             raise ValueError(
-                f"recency windows must be strictly increasing; {window} <= {prev}")
-        result.append(window)
-        prev = window
-    if not result:
-        raise ValueError("recency windows must not be empty")
-    return result
+                "domain recency windows mismatch: "
+                f"missing={missing}, extra={extra}, expected={sorted(expected_domains)}")
+        by_domain = parsed
+    else:
+        raise TypeError(
+            f"parse_recency_windows returned unsupported type {type(parsed).__name__}")
+
+    normalized: Dict[str, npt.NDArray[np.int64]] = {}
+    dims: Dict[str, int] = {}
+    for domain in seq_domains:
+        values = _validate_recency_window_list(
+            list(by_domain[domain]),
+            f"domain_recency_windows[{domain!r}]",
+        )
+        normalized[domain] = np.array(values, dtype=np.int64)
+        dims[domain] = 4 + len(values)
+    return normalized, dims
 
 # Domain-specific time-delta bucket boundaries used when
 # ``--time_bucket_boundaries_json ""`` is passed. Keep every domain list the
@@ -319,7 +425,7 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         time_bucket_boundaries: Optional[Dict[str, List[int]]] = None,
         use_domain_recency_stats: bool = False,
-        domain_recency_windows: Optional[List[int]] = None,
+        domain_recency_windows: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -349,8 +455,10 @@ class PCVRParquetDataset(IterableDataset):
                 When omitted, the legacy shared ``BUCKET_BOUNDARIES`` are used.
             use_domain_recency_stats: whether to emit per-domain explicit
                 recency statistics derived from sequence timestamps.
-            domain_recency_windows: increasing second windows used for count
-                statistics when ``use_domain_recency_stats`` is enabled.
+            domain_recency_windows: shared increasing second windows, or a
+                mapping from every sequence domain to that domain's increasing
+                second windows. Used for count statistics when
+                ``use_domain_recency_stats`` is enabled.
         """
         super().__init__()
 
@@ -376,11 +484,6 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self.use_domain_recency_stats = bool(use_domain_recency_stats)
-        self.domain_recency_windows = np.array(
-            parse_recency_windows(domain_recency_windows),
-            dtype=np.int64,
-        )
-        self.domain_recency_stats_dim = 4 + len(self.domain_recency_windows)
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max
         self._timestamp_filter_enabled = (
@@ -421,6 +524,26 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket_boundaries,
             )
         )
+        self.domain_recency_windows, self.domain_recency_stats_dims = (
+            normalize_domain_recency_windows(
+                self.seq_domains,
+                domain_recency_windows,
+            )
+        )
+        self.domain_recency_stats_dim = (
+            next(iter(set(self.domain_recency_stats_dims.values())))
+            if len(set(self.domain_recency_stats_dims.values())) == 1
+            else 0
+        )
+        if self.use_domain_recency_stats:
+            logging.info(
+                "Domain recency windows: %s; stats dims: %s",
+                {
+                    domain: self.domain_recency_windows[domain].tolist()
+                    for domain in self.seq_domains
+                },
+                self.domain_recency_stats_dims,
+            )
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -776,6 +899,7 @@ class PCVRParquetDataset(IterableDataset):
 
     def _compute_domain_recency_stats(
         self,
+        domain: str,
         time_diff: "npt.NDArray[np.int64]",
         valid_mask: "npt.NDArray[np.bool_]",
     ) -> "npt.NDArray[np.float32]":
@@ -785,7 +909,8 @@ class PCVRParquetDataset(IterableDataset):
         ``[valid_count, min_age, mean_age, max_age, count<=window_1, ...]``.
         """
         B = time_diff.shape[0]
-        stats = np.zeros((B, self.domain_recency_stats_dim), dtype=np.float32)
+        windows = self.domain_recency_windows[domain]
+        stats = np.zeros((B, self.domain_recency_stats_dims[domain]), dtype=np.float32)
         valid_count = valid_mask.sum(axis=1).astype(np.float32)
         has_valid = valid_count > 0
         stats[:, 0] = np.log1p(valid_count)
@@ -808,7 +933,7 @@ class PCVRParquetDataset(IterableDataset):
         stats[:, 2] = np.log1p(mean_age)
         stats[:, 3] = np.log1p(max_age.astype(np.float32))
 
-        for idx, window in enumerate(self.domain_recency_windows):
+        for idx, window in enumerate(windows):
             count = ((time_diff <= int(window)) & valid_mask).sum(axis=1)
             stats[:, 4 + idx] = np.log1p(count.astype(np.float32))
 
@@ -1034,6 +1159,7 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
                 if self.use_domain_recency_stats:
                     recency_stats = self._compute_domain_recency_stats(
+                        domain,
                         time_diff,
                         valid_ts_mask,
                     )

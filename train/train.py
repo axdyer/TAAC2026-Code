@@ -283,9 +283,11 @@ def parse_args() -> argparse.Namespace:
                              'fusion. Disabled by default.')
     parser.add_argument('--domain_recency_windows', type=str,
                         default='300,900,3600,21600,86400,259200,604800,2592000',
-                        help='Strictly increasing second windows used by '
-                             '--use_domain_recency_fusion for recent-event count '
-                             'features.')
+                        help='Recent-event count windows used by '
+                             '--use_domain_recency_fusion. Accepts a shared '
+                             'comma-separated increasing second list, a JSON '
+                             'object/path keyed by seq_a..seq_d, or the preset '
+                             "'domain_specific'/'probe'/'hardcoded'.")
     parser.add_argument('--use_time_attention_bias', action='store_true', default=False,
                         help='Add a learnable key-side attention bias from each '
                              'sequence event time bucket. Disabled by default.')
@@ -562,6 +564,13 @@ def main() -> None:
         pcvr_dataset.domain_recency_stats_dim
         if args.use_domain_recency_fusion else 0
     )
+    args.recency_stats_dims = (
+        {
+            domain: int(dim)
+            for domain, dim in pcvr_dataset.domain_recency_stats_dims.items()
+        }
+        if args.use_domain_recency_fusion else {}
+    )
 
     if args.use_sample_time_token and args.sample_time_ref_ts == 'auto':
         resolved_ref_ts = pcvr_dataset.max_timestamp()
@@ -629,6 +638,7 @@ def main() -> None:
         "sample_time_timezone_offset_hours": args.sample_time_timezone_offset_hours,
         "use_domain_recency_fusion": args.use_domain_recency_fusion,
         "recency_stats_dim": args.recency_stats_dim,
+        "recency_stats_dims": args.recency_stats_dims,
         "use_time_attention_bias": args.use_time_attention_bias,
         "time_attention_bias_domains": args.time_attention_bias_domains,
         "rank_mixer_mode": args.rank_mixer_mode,

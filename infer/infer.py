@@ -73,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'sample_time_timezone_offset_hours': 8,
     'use_domain_recency_fusion': False,
     'recency_stats_dim': 0,
+    'recency_stats_dims': {},
     'use_time_attention_bias': False,
     'time_attention_bias_domains': ['seq_a', 'seq_b', 'seq_c', 'seq_d'],
     'rank_mixer_mode': 'full',
@@ -419,6 +420,22 @@ def main() -> None:
         use_domain_recency_stats=use_domain_recency_fusion,
         domain_recency_windows=domain_recency_windows,
     )
+    if use_domain_recency_fusion:
+        expected_recency_dims = train_config.get('recency_stats_dims', None)
+        if expected_recency_dims:
+            expected_recency_dims = {
+                str(domain): int(dim)
+                for domain, dim in expected_recency_dims.items()
+            }
+            actual_recency_dims = {
+                str(domain): int(dim)
+                for domain, dim in test_dataset.domain_recency_stats_dims.items()
+            }
+            if expected_recency_dims != actual_recency_dims:
+                raise RuntimeError(
+                    "domain recency stats dims from train_config do not match "
+                    "the inference dataset configuration: "
+                    f"expected={expected_recency_dims}, actual={actual_recency_dims}")
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
 
