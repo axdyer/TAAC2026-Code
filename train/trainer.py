@@ -8,7 +8,7 @@ import os
 import shutil
 import logging
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -39,7 +39,7 @@ class PCVRHyFormerRankingTrainer:
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        valid_loader: DataLoader,
+        valid_loader: Any,
         lr: float,
         num_epochs: int,
         device: str,
@@ -66,7 +66,9 @@ class PCVRHyFormerRankingTrainer:
         self.raw_model: nn.Module = model
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
-        self.valid_loader: DataLoader = valid_loader
+        self.valid_loaders, self.multi_valid_enabled = self._normalize_valid_loaders(
+            valid_loader)
+        self.valid_loader: DataLoader = self.valid_loaders[0][1]
         self.writer = writer
         # schema_path is copied alongside every checkpoint so that infer.py can
         # rebuild the exact same feature schema the model was trained with.
@@ -132,6 +134,50 @@ class PCVRHyFormerRankingTrainer:
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_dtype={amp_dtype}, compile_model={compile_model}, "
                      f"show_progress_bar={show_progress_bar}")
+        logging.info(
+            "Validation loaders: %s",
+            ", ".join(name for name, _ in self.valid_loaders),
+        )
+        if self.multi_valid_enabled:
+            logging.info(
+                "Multi validation mode is enabled; %s is the primary metric "
+                "for checkpoint naming, best_model, and early stopping.",
+                self.valid_loaders[0][0],
+            )
+
+    @staticmethod
+    def _normalize_valid_loaders(
+        valid_loader: Any,
+    ) -> Tuple[List[Tuple[str, DataLoader]], bool]:
+        """Normalize a legacy loader or a list of named loaders."""
+        if isinstance(valid_loader, DataLoader):
+            return [('valid', valid_loader)], False
+        if isinstance(valid_loader, list):
+            if not valid_loader:
+                raise ValueError("valid_loader list must contain at least one loader")
+            result: List[Tuple[str, DataLoader]] = []
+            seen = set()
+            for idx, entry in enumerate(valid_loader, start=1):
+                if not (
+                    isinstance(entry, tuple)
+                    and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], DataLoader)
+                ):
+                    raise TypeError(
+                        "valid_loader list entries must be (name, DataLoader) "
+                        f"tuples, got {entry!r}")
+                name, loader = entry
+                if not name:
+                    raise ValueError(f"validation loader #{idx} has an empty name")
+                if name in seen:
+                    raise ValueError(f"duplicate validation loader name: {name}")
+                seen.add(name)
+                result.append((name, loader))
+            return result, True
+        raise TypeError(
+            "valid_loader must be a DataLoader or a list of (name, DataLoader) "
+            f"tuples, got {type(valid_loader).__name__}")
 
     @staticmethod
     def _resolve_amp_dtype(amp_dtype: str, device: str) -> Optional[torch.dtype]:
@@ -198,11 +244,12 @@ class PCVRHyFormerRankingTrainer:
         labels_np: np.ndarray,
         logits_np: np.ndarray,
         probs_np: np.ndarray,
+        split_name: str = 'valid',
     ) -> str:
         """Build a compact validation diagnostics log line."""
         n = int(probs_np.size)
         if n == 0:
-            return f"VALID_DIAGNOSTICS epoch={epoch} n=0"
+            return f"VALID_DIAGNOSTICS split={split_name} epoch={epoch} n=0"
 
         labels_float = labels_np.astype(np.float32, copy=False)
         pos_mask = labels_np == 1
@@ -221,6 +268,7 @@ class PCVRHyFormerRankingTrainer:
         fmt = self._format_diag_value
         return (
             "VALID_DIAGNOSTICS"
+            f" split={split_name}"
             f" epoch={epoch}"
             f" n={n}"
             f" pos={int(pos_mask.sum())}"
@@ -350,6 +398,7 @@ class PCVRHyFormerRankingTrainer:
         eval_index: Optional[int] = None,
         val_auc: Optional[float] = None,
         val_logloss: Optional[float] = None,
+        valid_metrics: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Save ``model.pt`` plus sidecar files under a ``global_step`` sub-dir.
 
@@ -384,6 +433,7 @@ class PCVRHyFormerRankingTrainer:
             "global_step": global_step,
             "val_AUC": val_auc,
             "val_logloss": val_logloss,
+            "valid_metrics": valid_metrics,
             "is_best": is_best,
         })
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
@@ -401,19 +451,109 @@ class PCVRHyFormerRankingTrainer:
                 device_batch[k] = v
         return device_batch
 
+    @staticmethod
+    def _optimizer_lr(optimizer: Optional[torch.optim.Optimizer]) -> Optional[float]:
+        if optimizer is None or not optimizer.param_groups:
+            return None
+        return float(optimizer.param_groups[0].get('lr', 0.0))
+
+    def _write_lr_scalars(self, total_step: int) -> None:
+        if not self.writer:
+            return
+        dense_lr = self._optimizer_lr(self.dense_optimizer)
+        if dense_lr is not None:
+            self.writer.add_scalar('LR/dense', dense_lr, total_step)
+        sparse_lr = self._optimizer_lr(self.sparse_optimizer)
+        if sparse_lr is not None:
+            self.writer.add_scalar('LR/sparse', sparse_lr, total_step)
+
+    @staticmethod
+    def _metrics_payload(
+        results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": r["name"],
+                "AUC": r["auc"],
+                "logloss": r["logloss"],
+            }
+            for r in results
+        ]
+
+    def _write_validation_scalars(
+        self,
+        results: List[Dict[str, Any]],
+        total_step: int,
+    ) -> None:
+        if not self.writer:
+            return
+        if self.multi_valid_enabled:
+            for idx, result in enumerate(results, start=1):
+                self.writer.add_scalar(
+                    f'AUC{idx}/valid', result['auc'], total_step)
+                self.writer.add_scalar(
+                    f'LogLoss{idx}/valid', result['logloss'], total_step)
+        else:
+            result = results[0]
+            self.writer.add_scalar('AUC/valid', result['auc'], total_step)
+            self.writer.add_scalar('LogLoss/valid', result['logloss'], total_step)
+
+    def _log_validation_results(
+        self,
+        prefix: str,
+        results: List[Dict[str, Any]],
+    ) -> None:
+        if self.multi_valid_enabled:
+            summary = " | ".join(
+                f"{r['name']}: AUC: {r['auc']}, LogLoss: {r['logloss']}"
+                for r in results
+            )
+            logging.info(f"{prefix} Validation | {summary}")
+        else:
+            result = results[0]
+            logging.info(
+                f"{prefix} Validation | AUC: {result['auc']}, "
+                f"LogLoss: {result['logloss']}")
+        for result in results:
+            diagnostics = result.get('diagnostics')
+            if diagnostics:
+                logging.info(diagnostics)
+
+    def evaluate_all(self, epoch: Optional[int] = None) -> List[Dict[str, Any]]:
+        results = []
+        for name, loader in self.valid_loaders:
+            auc, logloss = self.evaluate(
+                epoch=epoch,
+                valid_loader=loader,
+                valid_name=name,
+            )
+            results.append({
+                "name": name,
+                "auc": auc,
+                "logloss": logloss,
+                "diagnostics": self._last_eval_diagnostics_log,
+            })
+        return results
+
     def _handle_validation_result(
         self,
         total_step: int,
-        val_auc: float,
-        val_logloss: float,
+        results: List[Dict[str, Any]],
     ) -> None:
         """Save every eval checkpoint and keep a separate best checkpoint."""
+        if not results:
+            raise ValueError("validation results must not be empty")
+        primary = results[0]
+        val_auc = float(primary['auc'])
+        val_logloss = float(primary['logloss'])
+        valid_metrics = self._metrics_payload(results)
         self.eval_checkpoint_index += 1
         self._save_step_checkpoint(
             total_step,
             eval_index=self.eval_checkpoint_index,
             val_auc=val_auc,
             val_logloss=val_logloss,
+            valid_metrics=valid_metrics,
         )
 
         old_best = self.early_stopping.best_score
@@ -425,6 +565,8 @@ class PCVRHyFormerRankingTrainer:
             "best_val_logloss": val_logloss,
             "best_global_step": total_step,
             "best_eval_index": self.eval_checkpoint_index,
+            "best_valid_name": primary['name'],
+            "valid_metrics": valid_metrics,
         })
 
         if self.early_stopping.best_score != old_best and os.path.exists(
@@ -436,12 +578,14 @@ class PCVRHyFormerRankingTrainer:
                 "global_step": total_step,
                 "best_val_AUC": val_auc,
                 "best_val_logloss": val_logloss,
+                "best_valid_name": primary['name'],
+                "valid_metrics": valid_metrics,
                 "is_best": True,
             })
             logging.info(
                 f"Updated best checkpoint at {best_dir}/model.pt "
                 f"(eval={self.eval_checkpoint_index}, step={total_step}, "
-                f"AUC={val_auc}, LogLoss={val_logloss})"
+                f"{primary['name']} AUC={val_auc}, LogLoss={val_logloss})"
             )
 
     def train(self) -> None:
@@ -469,26 +613,22 @@ class PCVRHyFormerRankingTrainer:
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    self._write_lr_scalars(total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
                     logging.info(f"Evaluating at step {total_step}")
-                    val_auc, val_logloss = self.evaluate(epoch=epoch)
+                    results = self.evaluate_all(epoch=epoch)
                     self.model.train()
                     self.raw_model.train()
                     torch.cuda.empty_cache()
 
-                    logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
-                    if self._last_eval_diagnostics_log:
-                        logging.info(self._last_eval_diagnostics_log)
+                    self._log_validation_results(f"Step {total_step}", results)
+                    self._write_validation_scalars(results, total_step)
 
-                    if self.writer:
-                        self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                        self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
-
-                    self._handle_validation_result(total_step, val_auc, val_logloss)
+                    self._handle_validation_result(total_step, results)
 
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
@@ -502,20 +642,15 @@ class PCVRHyFormerRankingTrainer:
             logging.info(
                 f"Epoch {epoch}, Average Loss: {loss_sum / steps_in_epoch}")
 
-            val_auc, val_logloss = self.evaluate(epoch=epoch)
+            results = self.evaluate_all(epoch=epoch)
             self.model.train()
             self.raw_model.train()
             torch.cuda.empty_cache()
 
-            logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
-            if self._last_eval_diagnostics_log:
-                logging.info(self._last_eval_diagnostics_log)
+            self._log_validation_results(f"Epoch {epoch}", results)
+            self._write_validation_scalars(results, total_step)
 
-            if self.writer:
-                self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
-
-            self._handle_validation_result(total_step, val_auc, val_logloss)
+            self._handle_validation_result(total_step, results)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
@@ -607,19 +742,26 @@ class PCVRHyFormerRankingTrainer:
 
         return loss.item()
 
-    def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
-        """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
+    def evaluate(
+        self,
+        epoch: Optional[int] = None,
+        valid_loader: Optional[DataLoader] = None,
+        valid_name: str = 'valid',
+    ) -> Tuple[float, float]:
+        """Run validation over one loader and return ``(AUC, logloss)``.
 
         NaN predictions (which can arise from exploding gradients) are filtered
         out before computing both metrics.
         """
-        print("Start Evaluation (PCVRHyFormer) - validation")
+        if valid_loader is None:
+            valid_loader = self.valid_loader
+        print(f"Start Evaluation (PCVRHyFormer) - {valid_name}")
         self.model.eval()
         self.raw_model.eval()
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader),
+        pbar = tqdm(enumerate(valid_loader),
                     disable=not self.show_progress_bar)
 
         all_logits_list = []
@@ -630,6 +772,11 @@ class PCVRHyFormerRankingTrainer:
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
+
+        if not all_logits_list:
+            raise RuntimeError(
+                f"validation loader {valid_name} yielded no batches; "
+                "check timestamp windows and dataset filters")
 
         # Autocast may produce bf16 logits; CPU numpy and sklearn metrics
         # require fp32/float64-compatible arrays.
@@ -645,7 +792,9 @@ class PCVRHyFormerRankingTrainer:
         nan_mask = np.isnan(probs)
         if nan_mask.any():
             n_nan = int(nan_mask.sum())
-            logging.warning(f"[Evaluate] {n_nan}/{len(probs)} predictions are NaN, filtering them out")
+            logging.warning(
+                f"[Evaluate:{valid_name}] {n_nan}/{len(probs)} predictions "
+                "are NaN, filtering them out")
             valid_mask = ~nan_mask
             probs = probs[valid_mask]
             labels_np = labels_np[valid_mask]
@@ -657,7 +806,7 @@ class PCVRHyFormerRankingTrainer:
             auc = float(roc_auc_score(labels_np, probs))
 
         self._last_eval_diagnostics_log = self._build_eval_diagnostics_log(
-            epoch, labels_np, logits_np, probs)
+            epoch, labels_np, logits_np, probs, split_name=valid_name)
 
         # Binary logloss (same NaN filtering).
         valid_logits = all_logits[~torch.isnan(all_logits)]

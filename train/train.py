@@ -26,6 +26,7 @@ from dataset import (
     get_pcvr_data,
     load_time_bucket_boundaries_json,
     normalize_closed_timestamp_ranges,
+    normalize_closed_timestamp_windows,
     parse_recency_windows,
 )
 from model import PCVRHyFormer
@@ -212,6 +213,14 @@ def parse_args() -> argparse.Namespace:
                              '--split_mode manual_time. All ranges are closed: '
                              'TRAIN_MIN <= timestamp <= TRAIN_MAX and '
                              'VALID_MIN <= timestamp <= VALID_MAX.')
+    parser.add_argument('--multi_valid_time_ranges', type=int, nargs='+', default=None,
+                        metavar='TS',
+                        help='Enable multiple independent validation sets by '
+                             'closed timestamp windows, formatted as '
+                             'START1 END1 START2 END2 ... . The windows are '
+                             'filtered from the full dataset, kept separate, '
+                             'and may overlap. When omitted, training uses the '
+                             'legacy single validation split.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -415,7 +424,13 @@ def parse_args() -> argparse.Namespace:
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
-    args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
+    default_tf_events_dir = (
+        os.path.join(args.log_dir, 'tf_events') if args.log_dir else None
+    )
+    args.tf_events_dir = os.environ.get(
+        'TRAIN_TF_EVENTS_PATH',
+        default_tf_events_dir,
+    )
 
     return args
 
@@ -438,6 +453,15 @@ def main() -> None:
         if args.time_range is not None or args.time_ranges is not None:
             raise ValueError(
                 "--time_range/--time_ranges are only valid when --interval is set")
+    if args.multi_valid_time_ranges is not None:
+        args.multi_valid_time_ranges = normalize_closed_timestamp_windows(
+            args.multi_valid_time_ranges,
+            label="--multi_valid_time_ranges",
+        )
+        if not args.multi_valid_time_ranges:
+            raise ValueError(
+                "--multi_valid_time_ranges requires at least one "
+                "START END timestamp window")
     if args.split_mode == 'manual_time':
         if args.interval:
             raise ValueError(
@@ -568,6 +592,7 @@ def main() -> None:
         time_ranges=args.interval_time_ranges,
         interval=args.interval,
         train_val_range=args.train_val_range,
+        multi_valid_time_ranges=args.multi_valid_time_ranges,
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=args.use_domain_recency_fusion,
         domain_recency_windows=args.domain_recency_windows,

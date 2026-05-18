@@ -24,7 +24,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
 from torch.utils.data import IterableDataset, DataLoader
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 # numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
 # no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
@@ -145,6 +145,29 @@ def normalize_closed_timestamp_ranges(
                 f"{label} ranges must satisfy START <= END, got "
                 f"{start} > {end}")
     return _merge_closed_timestamp_ranges(ranges)
+
+
+def normalize_closed_timestamp_windows(
+    time_ranges: Optional[Any],
+    label: str = "--multi_valid_time_ranges",
+) -> Optional[List[TimestampRange]]:
+    """Normalize closed timestamp windows while preserving user order.
+
+    Unlike ``normalize_closed_timestamp_ranges``, this helper intentionally
+    does not merge overlapping or adjacent ranges. It is used for independent
+    validation windows, where ``[1, 5]`` and ``[3, 6]`` should remain two
+    separate validation sets.
+    """
+    ranges = _coerce_timestamp_range_pairs(time_ranges, label)
+    if not ranges:
+        return None
+
+    for start, end in ranges:
+        if start > end:
+            raise ValueError(
+                f"{label} windows must satisfy START <= END, got "
+                f"{start} > {end}")
+    return ranges
 
 
 def _closed_to_exclusive_timestamp_ranges(
@@ -1385,7 +1408,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     **kwargs: Any,
-) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
+) -> Tuple[DataLoader, Union[DataLoader, List[Tuple[str, DataLoader]]], PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
     Split modes:
@@ -1402,8 +1425,16 @@ def get_pcvr_data(
     ``time_ranges=[[START1, END1], ...]`` union, and the requested split mode
     is then applied to that sub-dataset.
 
+    When ``multi_valid_time_ranges`` is provided, the training split is still
+    built from ``split_mode`` as usual, but validation is replaced by a list of
+    independent full-dataset time-window loaders named ``valid1``,
+    ``valid2``, ... . Overlapping windows are allowed and are not merged.
+
     Returns:
-        A tuple ``(train_loader, valid_loader, train_dataset)``. The third
+        A tuple ``(train_loader, valid_loader, train_dataset)``. With
+        ``multi_valid_time_ranges``, the second element is a list of
+        ``(name, loader)`` pairs; otherwise it is the legacy single DataLoader.
+        The third
         element is returned so the caller can access the feature schema
         (``user_int_schema``, ``item_int_schema``, ...) needed to construct
         the model.
@@ -1416,8 +1447,13 @@ def get_pcvr_data(
     time_bucket_boundaries = kwargs.get('time_bucket_boundaries', None)
     use_domain_recency_stats = kwargs.get('use_domain_recency_stats', False)
     domain_recency_windows = kwargs.get('domain_recency_windows', None)
+    multi_valid_time_ranges = kwargs.get('multi_valid_time_ranges', None)
     closed_interval_ranges: Optional[List[TimestampRange]] = None
     interval_ranges: Optional[List[TimestampRange]] = None
+    multi_valid_closed_ranges: Optional[List[TimestampRange]] = (
+        normalize_closed_timestamp_windows(multi_valid_time_ranges)
+        if multi_valid_time_ranges is not None else None
+    )
     if interval:
         closed_interval_ranges = normalize_closed_timestamp_ranges(
             time_range=time_range,
@@ -1630,29 +1666,89 @@ def get_pcvr_data(
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
 
-    valid_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        row_group_range=valid_row_group_range,
-        row_groups=valid_row_groups,
-        timestamp_min=valid_timestamp_min,
-        timestamp_max=valid_timestamp_max,
-        timestamp_ranges=interval_ranges,
-        known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
-        clip_vocab=clip_vocab,
-        time_bucket_boundaries=time_bucket_boundaries,
-        use_domain_recency_stats=use_domain_recency_stats,
-        domain_recency_windows=domain_recency_windows,
-    )
+    valid_dataset = None
+    valid_loader: Any
+    audit_datasets: List[Tuple[str, PCVRParquetDataset]] = [('train', train_dataset)]
 
-    for split_name, dataset in (
-        ('train', train_dataset),
-        ('valid', valid_dataset),
-    ):
+    if multi_valid_closed_ranges is not None:
+        valid_entries = []
+        logging.info(
+            "Multi validation enabled: %s independent full-dataset time windows; "
+            "valid1 is used as the primary AUC for checkpoint naming, best_model, "
+            "and early stopping.",
+            len(multi_valid_closed_ranges),
+        )
+        for idx, (start, end) in enumerate(multi_valid_closed_ranges, start=1):
+            name = f"valid{idx}"
+            end_exclusive = end + 1
+            window_row_groups = _filter_rg_info_by_timestamp(
+                rg_info=rg_info,
+                timestamp_min=start,
+                timestamp_max=end_exclusive,
+            )
+            window_rows = sum(r[2] for r in window_row_groups)
+            if not window_row_groups or window_rows <= 0:
+                raise ValueError(
+                    f"No validation rows found for {name} closed time range "
+                    f"[{start}, {end}]")
+            window_dataset = PCVRParquetDataset(
+                parquet_path=data_dir,
+                schema_path=schema_path,
+                batch_size=batch_size,
+                seq_max_lens=seq_max_lens,
+                shuffle=False,
+                buffer_batches=0,
+                row_groups=window_row_groups,
+                timestamp_min=start,
+                timestamp_max=end_exclusive,
+                known_num_rows=window_rows,
+                clip_vocab=clip_vocab,
+                time_bucket_boundaries=time_bucket_boundaries,
+                use_domain_recency_stats=use_domain_recency_stats,
+                domain_recency_windows=domain_recency_windows,
+            )
+            window_loader = DataLoader(
+                window_dataset, batch_size=None,
+                num_workers=0, pin_memory=use_cuda,
+            )
+            valid_entries.append((name, window_loader))
+            audit_datasets.append((name, window_dataset))
+            logging.info(
+                "Multi validation window %s: closed_range=[%s, %s], rows=%s, "
+                "row_groups=%s",
+                name,
+                start,
+                end,
+                window_rows,
+                len(window_row_groups),
+            )
+        valid_loader = valid_entries
+    else:
+        valid_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            row_group_range=valid_row_group_range,
+            row_groups=valid_row_groups,
+            timestamp_min=valid_timestamp_min,
+            timestamp_max=valid_timestamp_max,
+            timestamp_ranges=interval_ranges,
+            known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
+            clip_vocab=clip_vocab,
+            time_bucket_boundaries=time_bucket_boundaries,
+            use_domain_recency_stats=use_domain_recency_stats,
+            domain_recency_windows=domain_recency_windows,
+        )
+        valid_loader = DataLoader(
+            valid_dataset, batch_size=None,
+            num_workers=0, pin_memory=use_cuda,
+        )
+        audit_datasets.append(('valid', valid_dataset))
+
+    for split_name, dataset in audit_datasets:
         stats = dataset.timestamp_stats()
         if stats['rows'] != dataset.num_rows:
             raise RuntimeError(
@@ -1668,9 +1764,10 @@ def get_pcvr_data(
             stats['timestamp_max'],
         )
 
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
+    valid_log_desc = (
+        f"multi_valid: {len(multi_valid_closed_ranges)} windows"
+        if multi_valid_closed_ranges is not None
+        else f"valid: {valid_rows} rows"
     )
 
     if split_mode == 'manual_time':
@@ -1678,7 +1775,7 @@ def get_pcvr_data(
             f"Parquet split_mode=manual_time, "
             f"train_time_range=[{manual_train_min}, {manual_train_max_exclusive - 1}], "
             f"valid_time_range=[{manual_valid_min}, {manual_valid_max_exclusive - 1}], "
-            f"train: {train_rows} rows, valid: {valid_rows} rows, "
+            f"train: {train_rows} rows, {valid_log_desc}, "
             f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
             f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
     elif interval:
@@ -1686,14 +1783,14 @@ def get_pcvr_data(
             f"Parquet split_mode={split_mode}, interval=True, "
             f"time_ranges={_format_closed_timestamp_ranges(closed_interval_ranges)}, "
             f"sub_row_groups={total_rgs}, sub_rows={sum(r[2] for r in split_rg_info)}, "
-            f"train: {train_rows} rows, valid: {valid_rows} rows, "
+            f"train: {train_rows} rows, {valid_log_desc}, "
             f"timestamp_cutoff={timestamp_cutoff}, "
             f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
             f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
     else:
         logging.info(
             f"Parquet split_mode={split_mode}, train: {train_rows} rows, "
-            f"valid: {valid_rows} rows, timestamp_cutoff={timestamp_cutoff}, "
+            f"{valid_log_desc}, timestamp_cutoff={timestamp_cutoff}, "
             f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
             f"prefetch_factor={prefetch_factor if num_workers > 0 else 0}")
 
