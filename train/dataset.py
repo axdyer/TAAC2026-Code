@@ -38,6 +38,163 @@ except ImportError:  # pragma: no cover
     npt = _NptFallback()  # type: ignore[assignment]
 
 
+TimestampRange = Tuple[int, int]
+
+
+def _coerce_timestamp_range_pairs(
+    value: Optional[Any],
+    label: str,
+) -> List[TimestampRange]:
+    """Parse either ``[s, e, ...]`` or ``[[s, e], ...]`` into pairs."""
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+
+    values = list(value)
+    if not values:
+        return []
+
+    nested = [isinstance(v, (list, tuple, np.ndarray)) for v in values]
+    pairs: List[TimestampRange] = []
+    if all(nested):
+        for pair in values:
+            pair_values = pair.tolist() if isinstance(pair, np.ndarray) else list(pair)
+            if len(pair_values) != 2:
+                raise ValueError(
+                    f"{label} must contain timestamp pairs, got {pair!r}")
+            pairs.append((int(pair_values[0]), int(pair_values[1])))
+    elif any(nested):
+        raise ValueError(
+            f"{label} must be either flat START END pairs or nested pairs, "
+            f"got {value!r}")
+    else:
+        if len(values) % 2 != 0:
+            raise ValueError(
+                f"{label} must contain an even number of Unix timestamps, "
+                f"got {len(values)} values")
+        for i in range(0, len(values), 2):
+            pairs.append((int(values[i]), int(values[i + 1])))
+    return pairs
+
+
+def _merge_closed_timestamp_ranges(
+    ranges: List[TimestampRange],
+) -> List[TimestampRange]:
+    if not ranges:
+        return []
+
+    merged: List[TimestampRange] = []
+    for start, end in sorted(ranges):
+        if not merged:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 1:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _merge_exclusive_timestamp_ranges(
+    ranges: List[TimestampRange],
+) -> List[TimestampRange]:
+    if not ranges:
+        return []
+
+    merged: List[TimestampRange] = []
+    for start, end in sorted(ranges):
+        if not merged:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def normalize_closed_timestamp_ranges(
+    time_range: Optional[Any] = None,
+    time_ranges: Optional[Any] = None,
+) -> Optional[List[TimestampRange]]:
+    """Normalize user-facing closed timestamp ranges.
+
+    ``time_range`` is the legacy single interval ``START END`` argument.
+    ``time_ranges`` accepts multiple closed intervals, either as a flat list
+    ``START1 END1 START2 END2`` or as nested pairs. The two arguments are
+    intentionally mutually exclusive to avoid silently widening a training
+    window because of an accidental leftover flag.
+    """
+    if time_range is not None and time_ranges is not None:
+        raise ValueError("--time_range and --time_ranges are mutually exclusive")
+
+    label = "--time_ranges" if time_ranges is not None else "--time_range"
+    ranges = _coerce_timestamp_range_pairs(
+        time_ranges if time_ranges is not None else time_range,
+        label,
+    )
+    if not ranges:
+        return None
+
+    for start, end in ranges:
+        if start > end:
+            raise ValueError(
+                f"{label} ranges must satisfy START <= END, got "
+                f"{start} > {end}")
+    return _merge_closed_timestamp_ranges(ranges)
+
+
+def _closed_to_exclusive_timestamp_ranges(
+    ranges: Optional[List[TimestampRange]],
+) -> Optional[List[TimestampRange]]:
+    if not ranges:
+        return None
+    return [(start, end + 1) for start, end in ranges]
+
+
+def _normalize_exclusive_timestamp_ranges(
+    timestamp_ranges: Optional[Any],
+) -> Optional[List[TimestampRange]]:
+    ranges = _coerce_timestamp_range_pairs(timestamp_ranges, "timestamp_ranges")
+    if not ranges:
+        return None
+    for start, end in ranges:
+        if start >= end:
+            raise ValueError(
+                f"timestamp_ranges must be half-open ranges with START < END, "
+                f"got {start} >= {end}")
+    return _merge_exclusive_timestamp_ranges(ranges)
+
+
+def _format_closed_timestamp_ranges(
+    ranges: Optional[List[TimestampRange]],
+) -> str:
+    if not ranges:
+        return "[]"
+    return "[" + ", ".join(f"[{start}, {end}]" for start, end in ranges) + "]"
+
+
+def _apply_timestamp_filter_np(
+    arr: "npt.NDArray[np.int64]",
+    timestamp_min: Optional[int] = None,
+    timestamp_max: Optional[int] = None,
+    timestamp_ranges: Optional[List[TimestampRange]] = None,
+) -> "npt.NDArray[np.int64]":
+    if timestamp_min is not None:
+        arr = arr[arr >= timestamp_min]
+    if timestamp_max is not None:
+        arr = arr[arr < timestamp_max]
+    if timestamp_ranges is not None:
+        mask = np.zeros(arr.shape, dtype=bool)
+        for start, end in timestamp_ranges:
+            mask |= (arr >= start) & (arr < end)
+        arr = arr[mask]
+    return arr
+
+
 # ─────────────────────────── Feature Schema ──────────────────────────────────
 
 
@@ -420,6 +577,7 @@ class PCVRParquetDataset(IterableDataset):
         row_groups: Optional[List[Tuple[str, int, int]]] = None,
         timestamp_min: Optional[int] = None,
         timestamp_max: Optional[int] = None,
+        timestamp_ranges: Optional[List[TimestampRange]] = None,
         known_num_rows: Optional[int] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
@@ -446,6 +604,9 @@ class PCVRParquetDataset(IterableDataset):
                 ``timestamp`` filtering.
             timestamp_max: optional exclusive upper bound for row-level
                 ``timestamp`` filtering.
+            timestamp_ranges: optional half-open timestamp ranges
+                ``[(start, end_exclusive), ...]``. When set, rows are kept
+                only if their ``timestamp`` falls in at least one range.
             known_num_rows: exact row count after filtering. Used for logging
                 and progress estimates when timestamp filtering is enabled.
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
@@ -467,6 +628,8 @@ class PCVRParquetDataset(IterableDataset):
                 raise ValueError(
                     f"timestamp_min must be < timestamp_max, got "
                     f"{timestamp_min} >= {timestamp_max}")
+        normalized_timestamp_ranges = _normalize_exclusive_timestamp_ranges(
+            timestamp_ranges)
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -486,8 +649,10 @@ class PCVRParquetDataset(IterableDataset):
         self.use_domain_recency_stats = bool(use_domain_recency_stats)
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max
+        self.timestamp_ranges = normalized_timestamp_ranges
         self._timestamp_filter_enabled = (
             timestamp_min is not None or timestamp_max is not None
+            or normalized_timestamp_ranges is not None
         )
         self._known_num_rows = known_num_rows is not None
         # Out-of-bound statistics:
@@ -613,7 +778,8 @@ class PCVRParquetDataset(IterableDataset):
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
             f"buffer_batches={buffer_batches}, shuffle={shuffle}, "
-            f"timestamp_min={timestamp_min}, timestamp_max={timestamp_max}")
+            f"timestamp_min={timestamp_min}, timestamp_max={timestamp_max}, "
+            f"timestamp_ranges={normalized_timestamp_ranges}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -727,10 +893,12 @@ class PCVRParquetDataset(IterableDataset):
                         f"timestamp contains null values in {file_path}, "
                         f"row_group={rg_idx}")
                 arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
-                if self.timestamp_min is not None:
-                    arr = arr[arr >= self.timestamp_min]
-                if self.timestamp_max is not None:
-                    arr = arr[arr < self.timestamp_max]
+                arr = _apply_timestamp_filter_np(
+                    arr,
+                    timestamp_min=self.timestamp_min,
+                    timestamp_max=self.timestamp_max,
+                    timestamp_ranges=self.timestamp_ranges,
+                )
                 if arr.size == 0:
                     continue
                 count += int(arr.shape[0])
@@ -830,6 +998,20 @@ class PCVRParquetDataset(IterableDataset):
                 pa.scalar(self.timestamp_max, type=ts_col.type),
             )
             mask = cond if mask is None else pc.and_(mask, cond)
+        if self.timestamp_ranges is not None:
+            range_mask = None
+            for start, end in self.timestamp_ranges:
+                lower = pc.greater_equal(
+                    ts_col,
+                    pa.scalar(start, type=ts_col.type),
+                )
+                upper = pc.less(
+                    ts_col,
+                    pa.scalar(end, type=ts_col.type),
+                )
+                cond = pc.and_(lower, upper)
+                range_mask = cond if range_mask is None else pc.or_(range_mask, cond)
+            mask = range_mask if mask is None else pc.and_(mask, range_mask)
 
         if mask is None:
             return batch
@@ -1215,9 +1397,10 @@ def get_pcvr_data(
       - ``manual_time``: use two explicit closed timestamp ranges passed via
         ``train_val_range=(train_min, train_max, valid_min, valid_max)``.
 
-    When ``interval`` is True, rows are first filtered to
-    ``[time_range_start, time_range_end]``, and the requested split mode is then
-    applied to that sub-dataset.
+    When ``interval`` is True, rows are first filtered to either the legacy
+    single closed ``time_range=[START, END]`` or the multi-interval closed
+    ``time_ranges=[[START1, END1], ...]`` union, and the requested split mode
+    is then applied to that sub-dataset.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -1228,22 +1411,24 @@ def get_pcvr_data(
     random.seed(seed)
     interval: bool = kwargs.get('interval', False)
     time_range = kwargs.get('time_range', None)
+    time_ranges = kwargs.get('time_ranges', None)
     train_val_range = kwargs.get('train_val_range', None)
     time_bucket_boundaries = kwargs.get('time_bucket_boundaries', None)
     use_domain_recency_stats = kwargs.get('use_domain_recency_stats', False)
     domain_recency_windows = kwargs.get('domain_recency_windows', None)
-    time_range_start: Optional[int] = None
-    time_range_end: Optional[int] = None
+    closed_interval_ranges: Optional[List[TimestampRange]] = None
+    interval_ranges: Optional[List[TimestampRange]] = None
     if interval:
-        if time_range is None or len(time_range) != 2:
+        closed_interval_ranges = normalize_closed_timestamp_ranges(
+            time_range=time_range,
+            time_ranges=time_ranges,
+        )
+        if not closed_interval_ranges:
             raise ValueError(
-                "--interval requires --time_range START END "
-                "(two Unix timestamps)")
-        time_range_start, time_range_end = int(time_range[0]), int(time_range[1])
-        if time_range_start > time_range_end:
-            raise ValueError(
-                f"time_range start must be <= end, got "
-                f"{time_range_start} > {time_range_end}")
+                "--interval requires --time_range START END or "
+                "--time_ranges START1 END1 [START2 END2 ...]")
+        interval_ranges = _closed_to_exclusive_timestamp_ranges(
+            closed_interval_ranges)
     if split_mode not in ('timestamp', 'rowgroup', 'manual_time'):
         raise ValueError(
             f"split_mode must be one of 'timestamp', 'rowgroup', 'manual_time', "
@@ -1317,8 +1502,8 @@ def get_pcvr_data(
     valid_timestamp_min: Optional[int] = None
     valid_timestamp_max: Optional[int] = None
 
-    interval_min = time_range_start if interval else None
-    interval_max = (time_range_end + 1) if interval else None
+    interval_min = interval_ranges[0][0] if interval_ranges else None
+    interval_max = interval_ranges[-1][1] if interval_ranges else None
     if split_mode == 'manual_time':
         train_row_groups = _filter_rg_info_by_timestamp(
             rg_info=rg_info,
@@ -1345,13 +1530,14 @@ def get_pcvr_data(
                 rg_info=rg_info,
                 timestamp_min=interval_min,
                 timestamp_max=interval_max,
+                timestamp_ranges=interval_ranges,
             )
             if interval else rg_info
         )
         if not split_rg_info:
             raise ValueError(
                 f"No rows found after applying interval filter "
-                f"[{time_range_start}, {time_range_end}]")
+                f"{_format_closed_timestamp_ranges(closed_interval_ranges)}")
     total_rgs = len(split_rg_info)
 
     if split_mode == 'manual_time':
@@ -1381,6 +1567,7 @@ def get_pcvr_data(
             valid_ratio=valid_ratio,
             timestamp_min=interval_min,
             timestamp_max=interval_max,
+            timestamp_ranges=interval_ranges,
         )
         train_timestamp_min = interval_min
         train_timestamp_max = timestamp_cutoff
@@ -1424,6 +1611,7 @@ def get_pcvr_data(
         row_groups=train_row_groups,
         timestamp_min=train_timestamp_min,
         timestamp_max=train_timestamp_max,
+        timestamp_ranges=interval_ranges,
         known_num_rows=train_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
         time_bucket_boundaries=time_bucket_boundaries,
@@ -1453,6 +1641,7 @@ def get_pcvr_data(
         row_groups=valid_row_groups,
         timestamp_min=valid_timestamp_min,
         timestamp_max=valid_timestamp_max,
+        timestamp_ranges=interval_ranges,
         known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
         clip_vocab=clip_vocab,
         time_bucket_boundaries=time_bucket_boundaries,
@@ -1495,7 +1684,7 @@ def get_pcvr_data(
     elif interval:
         logging.info(
             f"Parquet split_mode={split_mode}, interval=True, "
-            f"time_range=[{time_range_start}, {time_range_end}], "
+            f"time_ranges={_format_closed_timestamp_ranges(closed_interval_ranges)}, "
             f"sub_row_groups={total_rgs}, sub_rows={sum(r[2] for r in split_rg_info)}, "
             f"train: {train_rows} rows, valid: {valid_rows} rows, "
             f"timestamp_cutoff={timestamp_cutoff}, "
@@ -1515,10 +1704,12 @@ def _filter_rg_info_by_timestamp(
     rg_info: List[Tuple[str, int, int]],
     timestamp_min: Optional[int] = None,
     timestamp_max: Optional[int] = None,
+    timestamp_ranges: Optional[List[TimestampRange]] = None,
     scan_batch_size: int = 65536,
 ) -> List[Tuple[str, int, int]]:
     """Return Row Groups with their row counts after a timestamp filter."""
-    if timestamp_min is None and timestamp_max is None:
+    timestamp_ranges = _normalize_exclusive_timestamp_ranges(timestamp_ranges)
+    if timestamp_min is None and timestamp_max is None and timestamp_ranges is None:
         return rg_info
 
     filtered_rg_info: List[Tuple[str, int, int]] = []
@@ -1539,10 +1730,12 @@ def _filter_rg_info_by_timestamp(
                     f"timestamp contains null values in {file_path}, "
                     f"row_group={rg_idx}")
             arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
-            if timestamp_min is not None:
-                arr = arr[arr >= timestamp_min]
-            if timestamp_max is not None:
-                arr = arr[arr < timestamp_max]
+            arr = _apply_timestamp_filter_np(
+                arr,
+                timestamp_min=timestamp_min,
+                timestamp_max=timestamp_max,
+                timestamp_ranges=timestamp_ranges,
+            )
             count += int(arr.shape[0])
 
         if count > 0:
@@ -1556,9 +1749,11 @@ def _compute_timestamp_split(
     valid_ratio: float,
     timestamp_min: Optional[int] = None,
     timestamp_max: Optional[int] = None,
+    timestamp_ranges: Optional[List[TimestampRange]] = None,
     scan_batch_size: int = 65536,
 ) -> Tuple[int, int, int]:
     """Compute the timestamp cutoff for a strict row-level time split."""
+    timestamp_ranges = _normalize_exclusive_timestamp_ranges(timestamp_ranges)
     total_rows = sum(n for _, _, n in rg_info)
     if total_rows <= 1:
         raise ValueError(f"Need at least 2 rows for timestamp split, got {total_rows}")
@@ -1579,10 +1774,12 @@ def _compute_timestamp_split(
                     f"timestamp contains null values in {file_path}, "
                     f"row_group={rg_idx}")
             arr = col.to_numpy(zero_copy_only=False).astype(np.int64)
-            if timestamp_min is not None:
-                arr = arr[arr >= timestamp_min]
-            if timestamp_max is not None:
-                arr = arr[arr < timestamp_max]
+            arr = _apply_timestamp_filter_np(
+                arr,
+                timestamp_min=timestamp_min,
+                timestamp_max=timestamp_max,
+                timestamp_ranges=timestamp_ranges,
+            )
             if arr.size > 0:
                 chunks.append(arr)
 

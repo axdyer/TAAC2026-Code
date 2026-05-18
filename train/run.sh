@@ -22,8 +22,9 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 
 # ---- Time-range filter mode (--interval) ----
-# After the train/valid split, further filter both sets to a [start, end) timestamp window.
+# First filter rows to one or more closed [start, end] timestamp windows, then split.
 #   --interval --time_range START END
+#   --interval --time_ranges START1 END1 START2 END2 START3 END3
 #
 # Example: split by rowgroup, then keep only March 21-23 data:
 #   bash run.sh --split_mode rowgroup --interval --time_range 1774080000 1774252800

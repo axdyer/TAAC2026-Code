@@ -25,6 +25,7 @@ from dataset import (
     HARDCODED_DOMAIN_TIME_BUCKET_BOUNDARIES,
     get_pcvr_data,
     load_time_bucket_boundaries_json,
+    normalize_closed_timestamp_ranges,
     parse_recency_windows,
 )
 from model import PCVRHyFormer
@@ -190,13 +191,21 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of data used for validation. timestamp split uses '
                              'the latest rows by timestamp; rowgroup split uses tail Row Groups.')
     parser.add_argument('--interval', action='store_true', default=False,
-                        help='First keep rows whose timestamp falls in --time_range, '
+                        help='First keep rows whose timestamp falls in --time_range '
+                             'or --time_ranges, '
                              'then apply --split_mode on that sub-dataset. '
-                             'Requires --time_range START END.')
+                             'Requires a timestamp interval argument.')
     parser.add_argument('--time_range', type=int, nargs=2, default=None,
                         metavar=('START', 'END'),
-                        help='Time range filter (Unix timestamps), used when --interval '
-                             'is set. Rows with START <= timestamp <= END are kept.')
+                        help='Single closed time range filter (Unix timestamps), '
+                             'used when --interval is set. Rows with '
+                             'START <= timestamp <= END are kept.')
+    parser.add_argument('--time_ranges', type=int, nargs='+', default=None,
+                        metavar='TS',
+                        help='Multiple closed time ranges for --interval, formatted '
+                             'as START1 END1 START2 END2 ... . Rows outside the '
+                             'union of these intervals are filtered out. Mutually '
+                             'exclusive with --time_range.')
     parser.add_argument('--train_val_range', type=int, nargs=4, default=None,
                         metavar=('TRAIN_MIN', 'TRAIN_MAX', 'VALID_MIN', 'VALID_MAX'),
                         help='Manual train/valid time ranges for '
@@ -416,14 +425,19 @@ def main() -> None:
     if args.num_workers > 0 and args.prefetch_factor < 1:
         raise ValueError("--prefetch_factor must be >= 1 when --num_workers > 0")
     if args.interval:
-        if args.time_range is None or len(args.time_range) != 2:
+        args.interval_time_ranges = normalize_closed_timestamp_ranges(
+            time_range=args.time_range,
+            time_ranges=args.time_ranges,
+        )
+        if not args.interval_time_ranges:
             raise ValueError(
-                "--interval requires --time_range START END "
-                "(two Unix timestamps)")
-        if args.time_range[0] > args.time_range[1]:
+                "--interval requires --time_range START END or "
+                "--time_ranges START1 END1 [START2 END2 ...]")
+    else:
+        args.interval_time_ranges = None
+        if args.time_range is not None or args.time_ranges is not None:
             raise ValueError(
-                f"--time_range start must be <= end, got "
-                f"{args.time_range[0]} > {args.time_range[1]}")
+                "--time_range/--time_ranges are only valid when --interval is set")
     if args.split_mode == 'manual_time':
         if args.interval:
             raise ValueError(
@@ -550,7 +564,8 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        time_range=args.time_range,
+        time_range=None,
+        time_ranges=args.interval_time_ranges,
         interval=args.interval,
         train_val_range=args.train_val_range,
         time_bucket_boundaries=time_bucket_boundaries,
