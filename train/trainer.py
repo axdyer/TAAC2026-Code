@@ -717,6 +717,17 @@ class PCVRHyFormerRankingTrainer:
         """Run a single training step and return the scalar loss value."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
+        sample_weight = device_batch.get('sample_weight')
+        if sample_weight is not None:
+            sample_weight = sample_weight.float()
+            if sample_weight.shape != label.shape:
+                raise RuntimeError(
+                    "sample_weight shape must match label shape, got "
+                    f"{tuple(sample_weight.shape)} vs {tuple(label.shape)}")
+            if not torch.isfinite(sample_weight).all():
+                raise RuntimeError("sample_weight contains non-finite values")
+            if (sample_weight <= 0).any():
+                raise RuntimeError("sample_weight must be strictly positive")
 
         self.dense_optimizer.zero_grad(set_to_none=True)
         if self.sparse_optimizer is not None:
@@ -728,9 +739,27 @@ class PCVRHyFormerRankingTrainer:
             logits = logits.squeeze(-1)  # (B,)
 
             if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                raw_loss = sigmoid_focal_loss(
+                    logits,
+                    label,
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma,
+                    reduction='none',
+                )
             else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+                raw_loss = F.binary_cross_entropy_with_logits(
+                    logits,
+                    label,
+                    reduction='none',
+                )
+            if sample_weight is not None:
+                denom = sample_weight.sum()
+                if denom <= 0:
+                    raise RuntimeError(
+                        "sample_weight sum must be positive for weighted loss")
+                loss = (raw_loss * sample_weight).sum() / denom
+            else:
+                loss = raw_loss.mean()
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.

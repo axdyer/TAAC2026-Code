@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover
 
 
 TimestampRange = Tuple[int, int]
+SampleWeightRange = Tuple[int, int, float]
 
 
 def _coerce_timestamp_range_pairs(
@@ -198,6 +199,64 @@ def _format_closed_timestamp_ranges(
     if not ranges:
         return "[]"
     return "[" + ", ".join(f"[{start}, {end}]" for start, end in ranges) + "]"
+
+
+def normalize_sample_weight_ranges(
+    value: Optional[Any],
+) -> List[SampleWeightRange]:
+    """Parse user-facing sample weight ranges.
+
+    Expected string format:
+        ``START,END,WEIGHT;START,END,WEIGHT``
+
+    Ranges are closed intervals and must not overlap. Adjacent ranges such as
+    ``[1, 2]`` and ``[3, 4]`` are allowed.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        entries = [part.strip() for part in text.split(';') if part.strip()]
+    else:
+        entries = list(value)
+        if not entries:
+            return []
+
+    ranges: List[SampleWeightRange] = []
+    for idx, entry in enumerate(entries, start=1):
+        if isinstance(entry, str):
+            parts = [p.strip() for p in entry.split(',')]
+        else:
+            parts = list(entry)
+        if len(parts) != 3:
+            raise ValueError(
+                "--sample_weight_ranges entries must be START,END,WEIGHT; "
+                f"entry #{idx} is {entry!r}")
+        start = int(parts[0])
+        end = int(parts[1])
+        weight = float(parts[2])
+        if start > end:
+            raise ValueError(
+                "--sample_weight_ranges uses closed intervals and requires "
+                f"START <= END, got {start} > {end}")
+        if not np.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                "--sample_weight_ranges weights must be finite positive "
+                f"numbers, got {weight!r} for [{start}, {end}]")
+        ranges.append((start, end, weight))
+
+    sorted_ranges = sorted(ranges, key=lambda x: (x[0], x[1]))
+    for prev, curr in zip(sorted_ranges, sorted_ranges[1:]):
+        prev_start, prev_end, _ = prev
+        curr_start, curr_end, _ = curr
+        if curr_start <= prev_end:
+            raise ValueError(
+                "--sample_weight_ranges must not overlap; got closed "
+                f"ranges [{prev_start}, {prev_end}] and "
+                f"[{curr_start}, {curr_end}]")
+    return sorted_ranges
 
 
 def _apply_timestamp_filter_np(
@@ -607,6 +666,10 @@ class PCVRParquetDataset(IterableDataset):
         time_bucket_boundaries: Optional[Dict[str, List[int]]] = None,
         use_domain_recency_stats: bool = False,
         domain_recency_windows: Optional[Any] = None,
+        use_sample_weight: bool = False,
+        sample_weight_ranges: Optional[List[SampleWeightRange]] = None,
+        sample_weight_default: float = 1.0,
+        sample_weight_normalize: str = 'mean',
     ) -> None:
         """
         Args:
@@ -643,8 +706,32 @@ class PCVRParquetDataset(IterableDataset):
                 mapping from every sequence domain to that domain's increasing
                 second windows. Used for count statistics when
                 ``use_domain_recency_stats`` is enabled.
+            use_sample_weight: whether to emit a per-sample training weight.
+            sample_weight_ranges: closed timestamp intervals with explicit
+                weights. Only used when ``use_sample_weight`` is true.
+            sample_weight_default: finite positive default weight for rows that
+                do not fall into any configured interval.
+            sample_weight_normalize: ``mean`` divides emitted weights by the
+                training split mean raw weight. ``none`` leaves raw weights.
         """
         super().__init__()
+
+        if sample_weight_normalize not in ('mean', 'none'):
+            raise ValueError(
+                "sample_weight_normalize must be 'mean' or 'none', got "
+                f"{sample_weight_normalize!r}")
+        if not np.isfinite(sample_weight_default) or sample_weight_default <= 0.0:
+            raise ValueError(
+                "sample_weight_default must be a finite positive number, got "
+                f"{sample_weight_default!r}")
+        normalized_sample_weight_ranges = normalize_sample_weight_ranges(
+            sample_weight_ranges)
+        if use_sample_weight and not is_training:
+            raise ValueError("use_sample_weight is only valid for training datasets")
+        if use_sample_weight and not normalized_sample_weight_ranges:
+            raise ValueError(
+                "use_sample_weight=True requires at least one "
+                "sample_weight_ranges entry")
 
         if timestamp_min is not None and timestamp_max is not None:
             if timestamp_min >= timestamp_max:
@@ -670,6 +757,13 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self.use_domain_recency_stats = bool(use_domain_recency_stats)
+        self.use_sample_weight = bool(use_sample_weight)
+        self.sample_weight_ranges = normalized_sample_weight_ranges
+        self.sample_weight_default = float(sample_weight_default)
+        self.sample_weight_normalize = sample_weight_normalize
+        self.sample_weight_divisor: Optional[float] = (
+            1.0 if sample_weight_normalize == 'none' else None
+        )
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max
         self.timestamp_ranges = normalized_timestamp_ranges
@@ -938,6 +1032,170 @@ class PCVRParquetDataset(IterableDataset):
             'rows': count,
             'timestamp_min': int(min_ts),
             'timestamp_max': int(max_ts),
+        }
+
+    def _timestamp_filter_mask_np(
+        self,
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> "npt.NDArray[np.bool_]":
+        mask = np.ones(timestamps.shape, dtype=bool)
+        if self.timestamp_min is not None:
+            mask &= timestamps >= self.timestamp_min
+        if self.timestamp_max is not None:
+            mask &= timestamps < self.timestamp_max
+        if self.timestamp_ranges is not None:
+            range_mask = np.zeros(timestamps.shape, dtype=bool)
+            for start, end in self.timestamp_ranges:
+                range_mask |= (timestamps >= start) & (timestamps < end)
+            mask &= range_mask
+        return mask
+
+    def _sample_weights_np(
+        self,
+        timestamps: "npt.NDArray[np.int64]",
+        normalize: bool = True,
+    ) -> "npt.NDArray[np.float32]":
+        weights = np.full(
+            timestamps.shape,
+            self.sample_weight_default,
+            dtype=np.float32,
+        )
+        for start, end, weight in self.sample_weight_ranges:
+            mask = (timestamps >= start) & (timestamps <= end)
+            weights[mask] = np.float32(weight)
+        if normalize and self.sample_weight_normalize == 'mean':
+            if self.sample_weight_divisor is None:
+                raise RuntimeError(
+                    "sample_weight_normalize='mean' requires "
+                    "sample_weight_audit(set_normalizer=True) before iteration")
+            weights = weights / np.float32(self.sample_weight_divisor)
+        return weights
+
+    def sample_weight_audit(
+        self,
+        scan_batch_size: int = 65536,
+        set_normalizer: bool = False,
+    ) -> Dict[str, Any]:
+        """Scan the actual training split and summarize sample weights."""
+        if not self.use_sample_weight:
+            raise RuntimeError("sample_weight_audit called when sample weighting is disabled")
+        if 'timestamp' not in self._col_idx:
+            raise KeyError(
+                "Cannot compute sample weights because the parquet schema "
+                "does not contain a 'timestamp' column")
+        if 'label_type' not in self._col_idx:
+            raise KeyError(
+                "Cannot audit sample weights because the parquet schema does "
+                "not contain a 'label_type' column")
+
+        total_rows = 0
+        pos_rows = 0
+        weight_sum = 0.0
+        weighted_pos_sum = 0.0
+        weight_min = float('inf')
+        weight_max = float('-inf')
+        default_rows = 0
+        default_pos = 0
+        range_rows = [0 for _ in self.sample_weight_ranges]
+        range_pos = [0 for _ in self.sample_weight_ranges]
+
+        for file_path, rg_idx, _ in self._rg_list:
+            pf = pq.ParquetFile(file_path)
+            for batch in pf.iter_batches(
+                batch_size=scan_batch_size,
+                row_groups=[rg_idx],
+                columns=['timestamp', 'label_type'],
+            ):
+                ts_col = batch.column(0)
+                label_col = batch.column(1)
+                if ts_col.null_count:
+                    raise ValueError(
+                        f"timestamp contains null values in {file_path}, "
+                        f"row_group={rg_idx}")
+                timestamps = ts_col.to_numpy(zero_copy_only=False).astype(np.int64)
+                labels = (label_col.fill_null(0)
+                          .to_numpy(zero_copy_only=False).astype(np.int64) == 2)
+                keep_mask = self._timestamp_filter_mask_np(timestamps)
+                if not keep_mask.any():
+                    continue
+                timestamps = timestamps[keep_mask]
+                labels = labels[keep_mask]
+                raw_weights = self._sample_weights_np(timestamps, normalize=False)
+
+                total_rows += int(timestamps.shape[0])
+                pos_rows += int(labels.sum())
+                weight_sum += float(raw_weights.sum(dtype=np.float64))
+                weighted_pos_sum += float(raw_weights[labels].sum(dtype=np.float64))
+                weight_min = min(weight_min, float(raw_weights.min()))
+                weight_max = max(weight_max, float(raw_weights.max()))
+
+                matched_any = np.zeros(timestamps.shape, dtype=bool)
+                for idx, (start, end, _) in enumerate(self.sample_weight_ranges):
+                    range_mask = (timestamps >= start) & (timestamps <= end)
+                    if range_mask.any():
+                        range_rows[idx] += int(range_mask.sum())
+                        range_pos[idx] += int(labels[range_mask].sum())
+                        matched_any |= range_mask
+                default_mask = ~matched_any
+                if default_mask.any():
+                    default_rows += int(default_mask.sum())
+                    default_pos += int(labels[default_mask].sum())
+
+        if total_rows <= 0:
+            raise ValueError(
+                "No rows found while auditing sample weights. Check split "
+                "settings and timestamp filters.")
+        for idx, count in enumerate(range_rows):
+            if count <= 0:
+                start, end, weight = self.sample_weight_ranges[idx]
+                raise ValueError(
+                    "sample_weight_ranges entry matched zero training rows: "
+                    f"[{start}, {end}], weight={weight}")
+
+        raw_mean = weight_sum / float(total_rows)
+        if not np.isfinite(raw_mean) or raw_mean <= 0.0:
+            raise RuntimeError(f"Invalid sample weight mean: {raw_mean}")
+        if set_normalizer and self.sample_weight_normalize == 'mean':
+            self.sample_weight_divisor = float(raw_mean)
+
+        range_summaries = []
+        for idx, (start, end, weight) in enumerate(self.sample_weight_ranges):
+            rows = range_rows[idx]
+            pos = range_pos[idx]
+            range_summaries.append({
+                'index': idx + 1,
+                'start': start,
+                'end': end,
+                'weight': float(weight),
+                'rows': rows,
+                'pos': pos,
+                'label_rate': float(pos / rows) if rows > 0 else float('nan'),
+            })
+
+        return {
+            'rows': total_rows,
+            'pos': pos_rows,
+            'neg': total_rows - pos_rows,
+            'label_rate': float(pos_rows / total_rows),
+            'weighted_label_rate': float(weighted_pos_sum / weight_sum),
+            'weight_min': weight_min,
+            'weight_max': weight_max,
+            'weight_mean_raw': float(raw_mean),
+            'weight_divisor': float(self.sample_weight_divisor or 1.0),
+            'weight_mean_effective': (
+                float(raw_mean / self.sample_weight_divisor)
+                if self.sample_weight_divisor else float(raw_mean)
+            ),
+            'default': {
+                'weight': float(self.sample_weight_default),
+                'rows': default_rows,
+                'pos': default_pos,
+                'label_rate': (
+                    float(default_pos / default_rows)
+                    if default_rows > 0 else float('nan')
+                ),
+            },
+            'ranges': range_summaries,
         }
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
@@ -1215,6 +1473,9 @@ class PCVRParquetDataset(IterableDataset):
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
         else:
             labels = np.zeros(B, dtype=np.int64)
+        sample_weights = None
+        if self.use_sample_weight:
+            sample_weights = self._sample_weights_np(timestamps, normalize=True)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- user_int: write into pre-allocated buffer ----
@@ -1384,6 +1645,8 @@ class PCVRParquetDataset(IterableDataset):
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
+        if sample_weights is not None:
+            result['sample_weight'] = torch.from_numpy(sample_weights)
         # Merge sequence data, lengths, time buckets.
         result.update(seq_data_dict)
         result.update(seq_lens_dict)
@@ -1448,6 +1711,11 @@ def get_pcvr_data(
     use_domain_recency_stats = kwargs.get('use_domain_recency_stats', False)
     domain_recency_windows = kwargs.get('domain_recency_windows', None)
     multi_valid_time_ranges = kwargs.get('multi_valid_time_ranges', None)
+    use_sample_weight = bool(kwargs.get('use_sample_weight', False))
+    sample_weight_ranges = normalize_sample_weight_ranges(
+        kwargs.get('sample_weight_ranges', None))
+    sample_weight_default = float(kwargs.get('sample_weight_default', 1.0))
+    sample_weight_normalize = kwargs.get('sample_weight_normalize', 'mean')
     closed_interval_ranges: Optional[List[TimestampRange]] = None
     interval_ranges: Optional[List[TimestampRange]] = None
     multi_valid_closed_ranges: Optional[List[TimestampRange]] = (
@@ -1653,7 +1921,47 @@ def get_pcvr_data(
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=use_domain_recency_stats,
         domain_recency_windows=domain_recency_windows,
+        use_sample_weight=use_sample_weight,
+        sample_weight_ranges=sample_weight_ranges,
+        sample_weight_default=sample_weight_default,
+        sample_weight_normalize=sample_weight_normalize,
     )
+
+    if use_sample_weight:
+        audit = train_dataset.sample_weight_audit(set_normalizer=True)
+        logging.info(
+            "SAMPLE_WEIGHT_AUDIT rows=%s pos=%s neg=%s label_rate=%.6f "
+            "weighted_label_rate=%.6f weight_min=%.6f weight_max=%.6f "
+            "weight_mean_raw=%.6f weight_divisor=%.6f "
+            "weight_mean_effective=%.6f normalize=%s default_weight=%.6f "
+            "default_rows=%s default_label_rate=%.6f",
+            audit['rows'],
+            audit['pos'],
+            audit['neg'],
+            audit['label_rate'],
+            audit['weighted_label_rate'],
+            audit['weight_min'],
+            audit['weight_max'],
+            audit['weight_mean_raw'],
+            audit['weight_divisor'],
+            audit['weight_mean_effective'],
+            sample_weight_normalize,
+            audit['default']['weight'],
+            audit['default']['rows'],
+            audit['default']['label_rate'],
+        )
+        for range_info in audit['ranges']:
+            logging.info(
+                "SAMPLE_WEIGHT_RANGE index=%s start=%s end=%s weight=%.6f "
+                "rows=%s pos=%s label_rate=%.6f",
+                range_info['index'],
+                range_info['start'],
+                range_info['end'],
+                range_info['weight'],
+                range_info['rows'],
+                range_info['pos'],
+                range_info['label_rate'],
+            )
 
     use_cuda = torch.cuda.is_available()
     _train_kw = {}

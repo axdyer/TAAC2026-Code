@@ -13,6 +13,7 @@ import os
 import json
 import argparse
 import logging
+import math
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Union
@@ -27,6 +28,7 @@ from dataset import (
     load_time_bucket_boundaries_json,
     normalize_closed_timestamp_ranges,
     normalize_closed_timestamp_windows,
+    normalize_sample_weight_ranges,
     parse_recency_windows,
 )
 from model import PCVRHyFormer
@@ -227,6 +229,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--use_sample_weight', action='store_true', default=False,
+                        help='Enable timestamp-range sample weights for training '
+                             'loss. Validation and inference are never weighted.')
+    parser.add_argument('--sample_weight_ranges', type=str, default='',
+                        help='Semicolon-separated closed timestamp ranges with '
+                             'weights, formatted as START,END,WEIGHT;START,END,WEIGHT. '
+                             'Ranges must not overlap. Requires --use_sample_weight.')
+    parser.add_argument('--sample_weight_default', type=float, default=1.0,
+                        help='Default finite positive sample weight for rows that '
+                             'do not fall into --sample_weight_ranges.')
+    parser.add_argument('--sample_weight_normalize', type=str, default='mean',
+                        choices=['mean', 'none'],
+                        help='Sample-weight normalization. mean divides weights by '
+                             'their actual training-split mean so average loss scale '
+                             'stays near the unweighted run. none uses raw weights.')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -399,6 +416,25 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.user_feat_pair = parse_user_feat_pair(args.user_feat_pair)
+    args.sample_weight_ranges = normalize_sample_weight_ranges(
+        args.sample_weight_ranges)
+    if not math.isfinite(args.sample_weight_default):
+        raise ValueError(
+            "--sample_weight_default must be a finite positive number, got "
+            f"{args.sample_weight_default!r}")
+    if args.sample_weight_default <= 0.0:
+        raise ValueError(
+            "--sample_weight_default must be positive, got "
+            f"{args.sample_weight_default}")
+    if args.use_sample_weight:
+        if not args.sample_weight_ranges:
+            raise ValueError(
+                "--use_sample_weight requires --sample_weight_ranges "
+                "START,END,WEIGHT[;START,END,WEIGHT...]")
+    elif args.sample_weight_ranges:
+        raise ValueError(
+            "--sample_weight_ranges requires --use_sample_weight; refusing "
+            "to silently ignore configured sample weights")
     args.domain_recency_windows = parse_recency_windows(
         args.domain_recency_windows)
     args.time_attention_bias_domains = parse_domain_list(
@@ -596,6 +632,10 @@ def main() -> None:
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=args.use_domain_recency_fusion,
         domain_recency_windows=args.domain_recency_windows,
+        use_sample_weight=args.use_sample_weight,
+        sample_weight_ranges=args.sample_weight_ranges,
+        sample_weight_default=args.sample_weight_default,
+        sample_weight_normalize=args.sample_weight_normalize,
     )
     args.num_time_buckets = (
         pcvr_dataset.num_time_buckets if args.use_time_buckets else 0
