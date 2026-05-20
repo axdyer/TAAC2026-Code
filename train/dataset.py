@@ -1711,6 +1711,10 @@ def get_pcvr_data(
     use_domain_recency_stats = kwargs.get('use_domain_recency_stats', False)
     domain_recency_windows = kwargs.get('domain_recency_windows', None)
     multi_valid_time_ranges = kwargs.get('multi_valid_time_ranges', None)
+    rowgroup_valid_sub_time_start = kwargs.get(
+        'rowgroup_valid_sub_time_start', None)
+    rowgroup_valid_sub_time_end = kwargs.get(
+        'rowgroup_valid_sub_time_end', None)
     use_sample_weight = bool(kwargs.get('use_sample_weight', False))
     sample_weight_ranges = normalize_sample_weight_ranges(
         kwargs.get('sample_weight_ranges', None))
@@ -1722,6 +1726,31 @@ def get_pcvr_data(
         normalize_closed_timestamp_windows(multi_valid_time_ranges)
         if multi_valid_time_ranges is not None else None
     )
+    has_rowgroup_valid_sub = (
+        rowgroup_valid_sub_time_start is not None
+        or rowgroup_valid_sub_time_end is not None
+    )
+    rowgroup_valid_sub_range: Optional[TimestampRange] = None
+    if has_rowgroup_valid_sub:
+        if rowgroup_valid_sub_time_start is None or rowgroup_valid_sub_time_end is None:
+            raise ValueError(
+                "rowgroup valid sub range requires both "
+                "rowgroup_valid_sub_time_start and rowgroup_valid_sub_time_end")
+        if split_mode != 'rowgroup':
+            raise ValueError(
+                "rowgroup valid sub range is only supported with "
+                "--split_mode rowgroup")
+        if multi_valid_closed_ranges is not None:
+            raise ValueError(
+                "rowgroup valid sub range cannot be combined with "
+                "--multi_valid_time_ranges")
+        start = int(rowgroup_valid_sub_time_start)
+        end = int(rowgroup_valid_sub_time_end)
+        if start > end:
+            raise ValueError(
+                f"rowgroup valid sub range must satisfy START <= END, got "
+                f"{start} > {end}")
+        rowgroup_valid_sub_range = (start, end)
     if interval:
         closed_interval_ranges = normalize_closed_timestamp_ranges(
             time_range=time_range,
@@ -1805,6 +1834,7 @@ def get_pcvr_data(
     train_timestamp_max: Optional[int] = None
     valid_timestamp_min: Optional[int] = None
     valid_timestamp_max: Optional[int] = None
+    rowgroup_valid_sub_rows: Optional[int] = None
 
     interval_min = interval_ranges[0][0] if interval_ranges else None
     interval_max = interval_ranges[-1][1] if interval_ranges else None
@@ -1889,9 +1919,10 @@ def get_pcvr_data(
 
         train_rows = sum(r[2] for r in split_rg_info[:n_train_rgs])
         valid_rows = sum(r[2] for r in split_rg_info[n_train_rgs:])
+        rowgroup_valid_base_rg_info = split_rg_info[n_train_rgs:]
         if interval:
             train_row_groups = split_rg_info[:n_train_rgs]
-            valid_row_groups = split_rg_info[n_train_rgs:]
+            valid_row_groups = rowgroup_valid_base_rg_info
             train_timestamp_min = interval_min
             train_timestamp_max = interval_max
             valid_timestamp_min = interval_min
@@ -2056,6 +2087,60 @@ def get_pcvr_data(
         )
         audit_datasets.append(('valid', valid_dataset))
 
+        if rowgroup_valid_sub_range is not None:
+            sub_start, sub_end = rowgroup_valid_sub_range
+            sub_end_exclusive = sub_end + 1
+            sub_rg_source = (
+                valid_row_groups
+                if valid_row_groups is not None
+                else split_rg_info[valid_row_group_range[0]:valid_row_group_range[1]]
+            )
+            sub_row_groups = _filter_rg_info_by_timestamp(
+                rg_info=sub_rg_source,
+                timestamp_min=sub_start,
+                timestamp_max=sub_end_exclusive,
+                timestamp_ranges=interval_ranges,
+            )
+            rowgroup_valid_sub_rows = sum(r[2] for r in sub_row_groups)
+            if not sub_row_groups or rowgroup_valid_sub_rows <= 0:
+                raise ValueError(
+                    "No rows found for rowgroup validation sub window "
+                    f"[{sub_start}, {sub_end}] inside the rowgroup validation "
+                    "split. Check the timestamp range or valid_ratio.")
+
+            sub_dataset = PCVRParquetDataset(
+                parquet_path=data_dir,
+                schema_path=schema_path,
+                batch_size=batch_size,
+                seq_max_lens=seq_max_lens,
+                shuffle=False,
+                buffer_batches=0,
+                row_groups=sub_row_groups,
+                timestamp_min=sub_start,
+                timestamp_max=sub_end_exclusive,
+                timestamp_ranges=interval_ranges,
+                known_num_rows=rowgroup_valid_sub_rows,
+                clip_vocab=clip_vocab,
+                time_bucket_boundaries=time_bucket_boundaries,
+                use_domain_recency_stats=use_domain_recency_stats,
+                domain_recency_windows=domain_recency_windows,
+            )
+            sub_loader = DataLoader(
+                sub_dataset, batch_size=None,
+                num_workers=0, pin_memory=use_cuda,
+            )
+            valid_loader = [('valid', valid_loader), ('valid_sub', sub_loader)]
+            audit_datasets.append(('valid_sub', sub_dataset))
+            logging.info(
+                "Rowgroup validation sub window: closed_range=[%s, %s], "
+                "rows=%s, row_groups=%s. This is an observation-only metric; "
+                "training and primary valid are unchanged.",
+                sub_start,
+                sub_end,
+                rowgroup_valid_sub_rows,
+                len(sub_row_groups),
+            )
+
     for split_name, dataset in audit_datasets:
         stats = dataset.timestamp_stats()
         if stats['rows'] != dataset.num_rows:
@@ -2072,11 +2157,14 @@ def get_pcvr_data(
             stats['timestamp_max'],
         )
 
-    valid_log_desc = (
-        f"multi_valid: {len(multi_valid_closed_ranges)} windows"
-        if multi_valid_closed_ranges is not None
-        else f"valid: {valid_rows} rows"
-    )
+    if multi_valid_closed_ranges is not None:
+        valid_log_desc = f"multi_valid: {len(multi_valid_closed_ranges)} windows"
+    elif rowgroup_valid_sub_rows is not None:
+        valid_log_desc = (
+            f"valid: {valid_rows} rows, valid_sub: {rowgroup_valid_sub_rows} rows"
+        )
+    else:
+        valid_log_desc = f"valid: {valid_rows} rows"
 
     if split_mode == 'manual_time':
         logging.info(

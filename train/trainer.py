@@ -493,6 +493,11 @@ class PCVRHyFormerRankingTrainer:
                     f'AUC{idx}/valid', result['auc'], total_step)
                 self.writer.add_scalar(
                     f'LogLoss{idx}/valid', result['logloss'], total_step)
+                safe_name = result['name'].replace('/', '_')
+                self.writer.add_scalar(
+                    f'AUC/{safe_name}', result['auc'], total_step)
+                self.writer.add_scalar(
+                    f'LogLoss/{safe_name}', result['logloss'], total_step)
         else:
             result = results[0]
             self.writer.add_scalar('AUC/valid', result['auc'], total_step)

@@ -223,6 +223,15 @@ def parse_args() -> argparse.Namespace:
                              'filtered from the full dataset, kept separate, '
                              'and may overlap. When omitted, training uses the '
                              'legacy single validation split.')
+    parser.add_argument('--rowgroup_valid_sub_time_start', type=int, default=None,
+                        help='When --split_mode rowgroup is used, additionally '
+                             'evaluate a sub validation set filtered from the '
+                             'rowgroup validation split by this closed start '
+                             'timestamp. This only adds an observation metric; '
+                             'it does not change the train or primary valid split.')
+    parser.add_argument('--rowgroup_valid_sub_time_end', type=int, default=None,
+                        help='Closed end timestamp paired with '
+                             '--rowgroup_valid_sub_time_start.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -498,6 +507,27 @@ def main() -> None:
             raise ValueError(
                 "--multi_valid_time_ranges requires at least one "
                 "START END timestamp window")
+    has_rowgroup_valid_sub_start = args.rowgroup_valid_sub_time_start is not None
+    has_rowgroup_valid_sub_end = args.rowgroup_valid_sub_time_end is not None
+    if has_rowgroup_valid_sub_start != has_rowgroup_valid_sub_end:
+        raise ValueError(
+            "--rowgroup_valid_sub_time_start and "
+            "--rowgroup_valid_sub_time_end must be specified together")
+    if has_rowgroup_valid_sub_start:
+        if args.split_mode != 'rowgroup':
+            raise ValueError(
+                "--rowgroup_valid_sub_time_start/end are only valid with "
+                "--split_mode rowgroup")
+        if args.multi_valid_time_ranges is not None:
+            raise ValueError(
+                "--rowgroup_valid_sub_time_start/end cannot be combined with "
+                "--multi_valid_time_ranges; both create multiple validation "
+                "loaders with different semantics")
+        if args.rowgroup_valid_sub_time_start > args.rowgroup_valid_sub_time_end:
+            raise ValueError(
+                "rowgroup valid sub time range must satisfy START <= END, got "
+                f"{args.rowgroup_valid_sub_time_start} > "
+                f"{args.rowgroup_valid_sub_time_end}")
     if args.split_mode == 'manual_time':
         if args.interval:
             raise ValueError(
@@ -629,6 +659,8 @@ def main() -> None:
         interval=args.interval,
         train_val_range=args.train_val_range,
         multi_valid_time_ranges=args.multi_valid_time_ranges,
+        rowgroup_valid_sub_time_start=args.rowgroup_valid_sub_time_start,
+        rowgroup_valid_sub_time_end=args.rowgroup_valid_sub_time_end,
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=args.use_domain_recency_fusion,
         domain_recency_windows=args.domain_recency_windows,
