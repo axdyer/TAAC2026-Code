@@ -49,6 +49,58 @@ def build_feature_specs(
     return specs
 
 
+def load_initial_model_state(model: torch.nn.Module, checkpoint_path: str) -> None:
+    """Strictly initialize ``model`` from a saved ``state_dict`` checkpoint.
+
+    The training loop intentionally does not load optimizer state here. Stage-2
+    fine-tuning should start from stage-1 weights but use its own fresh
+    optimizer and learning-rate settings.
+    """
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location='cpu',
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "--init_checkpoint must point to a raw model state_dict saved by "
+            f"this trainer, got object type {type(checkpoint).__name__}: "
+            f"{checkpoint_path}"
+        )
+    non_string_keys = [key for key in checkpoint.keys() if not isinstance(key, str)]
+    if non_string_keys:
+        raise TypeError(
+            "--init_checkpoint state_dict contains non-string keys, first bad "
+            f"key={non_string_keys[0]!r}: {checkpoint_path}"
+        )
+    non_tensor_keys = [
+        key for key, value in checkpoint.items() if not torch.is_tensor(value)
+    ]
+    if non_tensor_keys:
+        raise TypeError(
+            "--init_checkpoint state_dict must contain only tensors, first bad "
+            f"key={non_tensor_keys[0]!r}: {checkpoint_path}"
+        )
+
+    incompatible = model.load_state_dict(checkpoint, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Strict checkpoint load returned incompatible keys despite "
+            "strict=True: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    num_tensors = len(checkpoint)
+    num_values = sum(value.numel() for value in checkpoint.values())
+    logging.info(
+        "Initialized model weights from --init_checkpoint=%s "
+        "(%s tensors, %s scalar values). Optimizer state was not loaded.",
+        checkpoint_path,
+        f"{num_tensors:,}",
+        f"{num_values:,}",
+    )
+
+
 def parse_user_feat_pair(value: str) -> List[int]:
     """Parse --user_feat_pair.
 
@@ -134,6 +186,12 @@ def parse_args() -> argparse.Namespace:
                         help='Checkpoint output directory (env: TRAIN_CKPT_PATH)')
     parser.add_argument('--log_dir', type=str, default=None,
                         help='Log directory (env: TRAIN_LOG_PATH)')
+    parser.add_argument('--init_checkpoint', type=str, default='',
+                        help='Optional model.pt path used to initialize model '
+                             'weights before training. This loads only the model '
+                             'state_dict with strict=True; optimizer state is not '
+                             'loaded. Use this for stage-2 fine-tuning from a '
+                             'stage-1 checkpoint with the same model structure.')
 
     # Training hyperparameters.
     parser.add_argument('--batch_size', type=int, default=256,
@@ -600,6 +658,12 @@ def main() -> None:
     # Initialize logger and RNG.
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
+    if args.init_checkpoint:
+        args.init_checkpoint = os.path.abspath(
+            os.path.expanduser(args.init_checkpoint))
+        if not os.path.isfile(args.init_checkpoint):
+            raise FileNotFoundError(
+                f"--init_checkpoint file not found: {args.init_checkpoint}")
     logging.info(f"Args: {vars(args)}")
 
     time_bucket_boundaries = None
@@ -789,6 +853,8 @@ def main() -> None:
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
+    if args.init_checkpoint:
+        load_initial_model_state(model, args.init_checkpoint)
 
     # ---- Training ----
     early_stopping = EarlyStopping(
