@@ -332,6 +332,14 @@ def parse_args() -> argparse.Namespace:
                              'comma-separated increasing second list, a JSON '
                              'object/path keyed by seq_a..seq_d, or the preset '
                              "'domain_specific'/'probe'/'hardcoded'.")
+    parser.add_argument('--domain_recency_stats_source', type=str, default='truncated',
+                        choices=['truncated', 'full'],
+                        help='Source sequence timestamps used to compute '
+                             '--use_domain_recency_fusion stats. truncated = '
+                             'current behavior, stats use the same truncated '
+                             'prefix as sequence tokens; full = sequence tokens '
+                             'stay truncated but stats use the full raw timestamp '
+                             'list for each domain.')
     parser.add_argument('--use_time_attention_bias', action='store_true', default=False,
                         help='Add a learnable key-side attention bias from each '
                              'sequence event time bucket. Disabled by default.')
@@ -579,6 +587,10 @@ def main() -> None:
             raise ValueError(
                 "--use_time_attention_bias requires at least one domain in "
                 "--time_attention_bias_domains")
+    if args.domain_recency_stats_source != 'truncated' and not args.use_domain_recency_fusion:
+        raise ValueError(
+            "--domain_recency_stats_source is only meaningful with "
+            "--use_domain_recency_fusion; refusing to silently ignore it")
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -664,6 +676,7 @@ def main() -> None:
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=args.use_domain_recency_fusion,
         domain_recency_windows=args.domain_recency_windows,
+        domain_recency_stats_source=args.domain_recency_stats_source,
         use_sample_weight=args.use_sample_weight,
         sample_weight_ranges=args.sample_weight_ranges,
         sample_weight_default=args.sample_weight_default,

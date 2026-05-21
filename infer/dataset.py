@@ -385,6 +385,7 @@ class PCVRParquetDataset(IterableDataset):
         time_bucket_boundaries: Optional[Dict[str, List[int]]] = None,
         use_domain_recency_stats: bool = False,
         domain_recency_windows: Optional[Any] = None,
+        domain_recency_stats_source: str = 'truncated',
     ) -> None:
         """
         Args:
@@ -416,6 +417,10 @@ class PCVRParquetDataset(IterableDataset):
                 mapping from every sequence domain to that domain's increasing
                 second windows. Used for count statistics when
                 ``use_domain_recency_stats`` is enabled.
+            domain_recency_stats_source: ``truncated`` computes recency stats
+                from the same timestamp prefix used by sequence tokens.
+                ``full`` keeps sequence tokens truncated but computes recency
+                stats from the full raw timestamp list for each domain.
         """
         super().__init__()
 
@@ -424,6 +429,14 @@ class PCVRParquetDataset(IterableDataset):
                 raise ValueError(
                     f"timestamp_min must be < timestamp_max, got "
                     f"{timestamp_min} >= {timestamp_max}")
+        if domain_recency_stats_source not in ('truncated', 'full'):
+            raise ValueError(
+                "domain_recency_stats_source must be 'truncated' or 'full', "
+                f"got {domain_recency_stats_source!r}")
+        if domain_recency_stats_source != 'truncated' and not use_domain_recency_stats:
+            raise ValueError(
+                "domain_recency_stats_source is only meaningful when "
+                "use_domain_recency_stats=True")
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -441,6 +454,7 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self.use_domain_recency_stats = bool(use_domain_recency_stats)
+        self.domain_recency_stats_source = domain_recency_stats_source
         self.timestamp_min = timestamp_min
         self.timestamp_max = timestamp_max
         self._timestamp_filter_enabled = (
@@ -489,12 +503,13 @@ class PCVRParquetDataset(IterableDataset):
         )
         if self.use_domain_recency_stats:
             logging.info(
-                "Domain recency windows: %s; stats dims: %s",
+                "Domain recency windows: %s; stats dims: %s; source=%s",
                 {
                     domain: self.domain_recency_windows[domain].tolist()
                     for domain in self.seq_domains
                 },
                 self.domain_recency_stats_dims,
+                self.domain_recency_stats_source,
             )
 
         # ---- Pre-compute column index lookup ----
@@ -862,6 +877,43 @@ class PCVRParquetDataset(IterableDataset):
 
         return stats
 
+    def _compute_domain_recency_stats_from_full_ts(
+        self,
+        domain: str,
+        sample_timestamps: "npt.NDArray[np.int64]",
+        ts_offsets: "npt.NDArray[np.int64]",
+        ts_values: "npt.NDArray[np.int64]",
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        """Build per-domain recency stats from the full raw timestamp list."""
+        windows = self.domain_recency_windows[domain]
+        stats = np.zeros((B, self.domain_recency_stats_dims[domain]), dtype=np.float32)
+
+        for i in range(B):
+            start = int(ts_offsets[i])
+            end = int(ts_offsets[i + 1])
+            if end <= start:
+                continue
+
+            raw_ts = ts_values[start:end]
+            valid_ts = raw_ts[raw_ts > 0]
+            valid_count = int(valid_ts.shape[0])
+            if valid_count == 0:
+                continue
+
+            ages = np.maximum(int(sample_timestamps[i]) - valid_ts.astype(np.int64), 0)
+            ages_f = ages.astype(np.float32)
+            stats[i, 0] = np.log1p(np.float32(valid_count))
+            stats[i, 1] = np.log1p(np.float32(ages.min()))
+            stats[i, 2] = np.log1p(ages_f.mean())
+            stats[i, 3] = np.log1p(np.float32(ages.max()))
+
+            for idx, window in enumerate(windows):
+                stats[i, 4 + idx] = np.log1p(
+                    np.float32((ages <= int(window)).sum()))
+
+        return stats
+
     def _pad_varlen_int_column(
         self,
         arrow_col: "pa.ListArray",
@@ -1081,11 +1133,24 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
                 if self.use_domain_recency_stats:
-                    recency_stats = self._compute_domain_recency_stats(
-                        domain,
-                        time_diff,
-                        valid_ts_mask,
-                    )
+                    if self.domain_recency_stats_source == 'truncated':
+                        recency_stats = self._compute_domain_recency_stats(
+                            domain,
+                            time_diff,
+                            valid_ts_mask,
+                        )
+                    elif self.domain_recency_stats_source == 'full':
+                        recency_stats = self._compute_domain_recency_stats_from_full_ts(
+                            domain,
+                            timestamps,
+                            ts_offs,
+                            ts_vals,
+                            B,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "unreachable domain_recency_stats_source: "
+                            f"{self.domain_recency_stats_source!r}")
                     seq_recency_dict[f'{domain}_recency_stats'] = torch.from_numpy(
                         recency_stats)
 

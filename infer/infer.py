@@ -407,6 +407,12 @@ def main() -> None:
         train_config.get('use_domain_recency_fusion', False))
     domain_recency_windows = parse_recency_windows(
         train_config.get('domain_recency_windows', None))
+    domain_recency_stats_source = train_config.get(
+        'domain_recency_stats_source', 'truncated')
+    if domain_recency_stats_source not in ('truncated', 'full'):
+        raise RuntimeError(
+            "train_config contains invalid domain_recency_stats_source: "
+            f"{domain_recency_stats_source!r}")
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -419,6 +425,7 @@ def main() -> None:
         time_bucket_boundaries=time_bucket_boundaries,
         use_domain_recency_stats=use_domain_recency_fusion,
         domain_recency_windows=domain_recency_windows,
+        domain_recency_stats_source=domain_recency_stats_source,
     )
     if use_domain_recency_fusion:
         expected_recency_dims = train_config.get('recency_stats_dims', None)
