@@ -1741,7 +1741,11 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     **kwargs: Any,
-) -> Tuple[DataLoader, Union[DataLoader, List[Tuple[str, DataLoader]]], PCVRParquetDataset]:
+) -> Tuple[
+    DataLoader,
+    Optional[Union[DataLoader, List[Tuple[str, DataLoader]]]],
+    PCVRParquetDataset,
+]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
     Split modes:
@@ -1766,11 +1770,11 @@ def get_pcvr_data(
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. With
         ``multi_valid_time_ranges``, the second element is a list of
-        ``(name, loader)`` pairs; otherwise it is the legacy single DataLoader.
-        The third
-        element is returned so the caller can access the feature schema
-        (``user_int_schema``, ``item_int_schema``, ...) needed to construct
-        the model.
+        ``(name, loader)`` pairs. With ``split_mode='rowgroup'`` and
+        ``valid_ratio=0``, it is ``None`` and validation is disabled. Otherwise
+        it is the legacy single DataLoader. The third element is returned so the
+        caller can access the feature schema (``user_int_schema``,
+        ``item_int_schema``, ...) needed to construct the model.
     """
     random.seed(seed)
     interval: bool = kwargs.get('interval', False)
@@ -1816,6 +1820,10 @@ def get_pcvr_data(
             raise ValueError(
                 "rowgroup valid sub range cannot be combined with "
                 "--multi_valid_time_ranges")
+        if valid_ratio == 0.0:
+            raise ValueError(
+                "rowgroup valid sub range requires a non-empty rowgroup "
+                "validation split; got valid_ratio=0")
         start = int(rowgroup_valid_sub_time_start)
         end = int(rowgroup_valid_sub_time_end)
         if start > end:
@@ -1838,8 +1846,20 @@ def get_pcvr_data(
         raise ValueError(
             f"split_mode must be one of 'timestamp', 'rowgroup', 'manual_time', "
             f"got {split_mode!r}")
-    if split_mode != 'manual_time' and not (0.0 < valid_ratio < 1.0):
-        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    if split_mode != 'manual_time':
+        if split_mode == 'rowgroup':
+            if not (0.0 <= valid_ratio < 1.0):
+                raise ValueError(
+                    "valid_ratio must be in [0, 1) with --split_mode "
+                    f"rowgroup, got {valid_ratio}")
+        elif multi_valid_closed_ranges is not None:
+            if not (0.0 <= valid_ratio < 1.0):
+                raise ValueError(
+                    "valid_ratio must be in [0, 1) when "
+                    "--multi_valid_time_ranges is provided, got "
+                    f"{valid_ratio}")
+        elif not (0.0 < valid_ratio < 1.0):
+            raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
     manual_train_min: Optional[int] = None
     manual_train_max_exclusive: Optional[int] = None
     manual_valid_min: Optional[int] = None
@@ -1968,19 +1988,42 @@ def get_pcvr_data(
             len(valid_row_groups),
         )
     elif split_mode == 'timestamp':
-        timestamp_cutoff, train_rows, valid_rows = _compute_timestamp_split(
-            rg_info=split_rg_info,
-            valid_ratio=valid_ratio,
-            timestamp_min=interval_min,
-            timestamp_max=interval_max,
-            timestamp_ranges=interval_ranges,
-        )
-        train_timestamp_min = interval_min
-        train_timestamp_max = timestamp_cutoff
-        valid_timestamp_min = timestamp_cutoff
-        valid_timestamp_max = interval_max
+        if valid_ratio == 0.0:
+            if multi_valid_closed_ranges is None:
+                raise ValueError(
+                    "valid_ratio=0 is only supported when "
+                    "--multi_valid_time_ranges provides validation loaders")
+            train_row_groups = split_rg_info
+            train_rows = sum(r[2] for r in split_rg_info)
+            valid_rows = 0
+            train_timestamp_min = interval_min
+            train_timestamp_max = interval_max
+            valid_timestamp_min = None
+            valid_timestamp_max = None
+            logging.info(
+                "Timestamp primary validation disabled by valid_ratio=0; "
+                "using all %s filtered rows for training and relying on "
+                "%s multi-validation windows.",
+                train_rows,
+                len(multi_valid_closed_ranges),
+            )
+        else:
+            timestamp_cutoff, train_rows, valid_rows = _compute_timestamp_split(
+                rg_info=split_rg_info,
+                valid_ratio=valid_ratio,
+                timestamp_min=interval_min,
+                timestamp_max=interval_max,
+                timestamp_ranges=interval_ranges,
+            )
+            train_timestamp_min = interval_min
+            train_timestamp_max = timestamp_cutoff
+            valid_timestamp_min = timestamp_cutoff
+            valid_timestamp_max = interval_max
     else:
-        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        if valid_ratio == 0.0:
+            n_valid_rgs = 0
+        else:
+            n_valid_rgs = max(1, int(total_rgs * valid_ratio))
         n_train_rgs = total_rgs - n_valid_rgs
 
         # train_ratio: use only the first N% of the training Row Groups.
@@ -2137,30 +2180,39 @@ def get_pcvr_data(
             )
         valid_loader = valid_entries
     else:
-        valid_dataset = PCVRParquetDataset(
-            parquet_path=data_dir,
-            schema_path=schema_path,
-            batch_size=batch_size,
-            seq_max_lens=seq_max_lens,
-            shuffle=False,
-            buffer_batches=0,
-            row_group_range=valid_row_group_range,
-            row_groups=valid_row_groups,
-            timestamp_min=valid_timestamp_min,
-            timestamp_max=valid_timestamp_max,
-            timestamp_ranges=interval_ranges,
-            known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
-            clip_vocab=clip_vocab,
-            time_bucket_boundaries=time_bucket_boundaries,
-            use_domain_recency_stats=use_domain_recency_stats,
-            domain_recency_windows=domain_recency_windows,
-            domain_recency_stats_source=domain_recency_stats_source,
-        )
-        valid_loader = DataLoader(
-            valid_dataset, batch_size=None,
-            num_workers=0, pin_memory=use_cuda,
-        )
-        audit_datasets.append(('valid', valid_dataset))
+        if valid_rows <= 0:
+            valid_loader = None
+            logging.info(
+                "Validation disabled by valid_ratio=0; training uses all %s "
+                "filtered rows and no validation metrics/best_model will be "
+                "produced.",
+                train_rows,
+            )
+        else:
+            valid_dataset = PCVRParquetDataset(
+                parquet_path=data_dir,
+                schema_path=schema_path,
+                batch_size=batch_size,
+                seq_max_lens=seq_max_lens,
+                shuffle=False,
+                buffer_batches=0,
+                row_group_range=valid_row_group_range,
+                row_groups=valid_row_groups,
+                timestamp_min=valid_timestamp_min,
+                timestamp_max=valid_timestamp_max,
+                timestamp_ranges=interval_ranges,
+                known_num_rows=valid_rows if split_mode in ('timestamp', 'manual_time') else None,
+                clip_vocab=clip_vocab,
+                time_bucket_boundaries=time_bucket_boundaries,
+                use_domain_recency_stats=use_domain_recency_stats,
+                domain_recency_windows=domain_recency_windows,
+                domain_recency_stats_source=domain_recency_stats_source,
+            )
+            valid_loader = DataLoader(
+                valid_dataset, batch_size=None,
+                num_workers=0, pin_memory=use_cuda,
+            )
+            audit_datasets.append(('valid', valid_dataset))
 
         if rowgroup_valid_sub_range is not None:
             sub_start, sub_end = rowgroup_valid_sub_range

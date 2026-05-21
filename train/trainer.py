@@ -68,7 +68,9 @@ class PCVRHyFormerRankingTrainer:
         self.train_loader: DataLoader = train_loader
         self.valid_loaders, self.multi_valid_enabled = self._normalize_valid_loaders(
             valid_loader)
-        self.valid_loader: DataLoader = self.valid_loaders[0][1]
+        self.valid_loader: Optional[DataLoader] = (
+            self.valid_loaders[0][1] if self.valid_loaders else None
+        )
         self.writer = writer
         # schema_path is copied alongside every checkpoint so that infer.py can
         # rebuild the exact same feature schema the model was trained with.
@@ -129,15 +131,26 @@ class PCVRHyFormerRankingTrainer:
         self.show_progress_bar: bool = show_progress_bar
         self._last_eval_diagnostics_log: Optional[str] = None
 
+        if not self.valid_loaders and self.eval_every_n_steps > 0:
+            raise ValueError(
+                "eval_every_n_steps requires at least one validation loader; "
+                "disable it when training with valid_ratio=0")
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_dtype={amp_dtype}, compile_model={compile_model}, "
                      f"show_progress_bar={show_progress_bar}")
-        logging.info(
-            "Validation loaders: %s",
-            ", ".join(name for name, _ in self.valid_loaders),
-        )
+        if self.valid_loaders:
+            logging.info(
+                "Validation loaders: %s",
+                ", ".join(name for name, _ in self.valid_loaders),
+            )
+        else:
+            logging.info(
+                "Validation disabled; checkpoints will be saved after each "
+                "epoch without AUC/logloss metrics and no best_model will be "
+                "selected.")
         if self.multi_valid_enabled:
             logging.info(
                 "Multi validation mode is enabled; %s is the primary metric "
@@ -150,6 +163,8 @@ class PCVRHyFormerRankingTrainer:
         valid_loader: Any,
     ) -> Tuple[List[Tuple[str, DataLoader]], bool]:
         """Normalize a legacy loader or a list of named loaders."""
+        if valid_loader is None:
+            return [], False
         if isinstance(valid_loader, DataLoader):
             return [('valid', valid_loader)], False
         if isinstance(valid_loader, list):
@@ -623,7 +638,11 @@ class PCVRHyFormerRankingTrainer:
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
                 # Step-level validation (only when eval_every_n_steps > 0).
-                if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
+                if (
+                    self.valid_loaders
+                    and self.eval_every_n_steps > 0
+                    and total_step % self.eval_every_n_steps == 0
+                ):
                     logging.info(f"Evaluating at step {total_step}")
                     results = self.evaluate_all(epoch=epoch)
                     self.model.train()
@@ -647,19 +666,30 @@ class PCVRHyFormerRankingTrainer:
             logging.info(
                 f"Epoch {epoch}, Average Loss: {loss_sum / steps_in_epoch}")
 
-            results = self.evaluate_all(epoch=epoch)
-            self.model.train()
-            self.raw_model.train()
-            torch.cuda.empty_cache()
+            if self.valid_loaders:
+                results = self.evaluate_all(epoch=epoch)
+                self.model.train()
+                self.raw_model.train()
+                torch.cuda.empty_cache()
 
-            self._log_validation_results(f"Epoch {epoch}", results)
-            self._write_validation_scalars(results, total_step)
+                self._log_validation_results(f"Epoch {epoch}", results)
+                self._write_validation_scalars(results, total_step)
 
-            self._handle_validation_result(total_step, results)
+                self._handle_validation_result(total_step, results)
 
-            if self.early_stopping.early_stop:
-                logging.info(f"Early stopping at epoch {epoch}")
-                break
+                if self.early_stopping.early_stop:
+                    logging.info(f"Early stopping at epoch {epoch}")
+                    break
+            else:
+                ckpt_dir = self._save_step_checkpoint(
+                    total_step,
+                    valid_metrics=[],
+                )
+                logging.info(
+                    "Epoch %s checkpoint saved without validation metrics: %s",
+                    epoch,
+                    ckpt_dir,
+                )
 
             # After the configured epoch, reinitialize high-cardinality sparse
             # params (Embeddings) as a form of cold restart to reduce overfit.
@@ -788,6 +818,10 @@ class PCVRHyFormerRankingTrainer:
         out before computing both metrics.
         """
         if valid_loader is None:
+            if self.valid_loader is None:
+                raise RuntimeError(
+                    "evaluate() called without a validation loader while "
+                    "validation is disabled")
             valid_loader = self.valid_loader
         print(f"Start Evaluation (PCVRHyFormer) - {valid_name}")
         self.model.eval()
